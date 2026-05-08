@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.*
+!.env.example
+
+node_modules/
+npm-debug.log*
+
+venv/
+venv_*/
+__pycache__/
+*.py[cod]
+
+build/
