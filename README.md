@@ -1,4 +1,4 @@
-# Tuebe
+# Turbe(미완성)
 
 YouTube 메타데이터 API 서버와 영상 ASCII 변환기를 함께 담은 프로젝트입니다.
 
