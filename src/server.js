@@ -219,11 +219,19 @@ function collectSearchVideos(node, videos, seen) {
     seen.add(item.videoId);
     videos.push({
       id: item.videoId,
-      title: getText(item.title),
-      channelTitle: getText(item.ownerText || item.shortBylineText || item.longBylineText),
-      publishedText: getText(item.publishedTimeText),
-      lengthText: getText(item.lengthText),
-      viewCountText: getText(item.viewCountText || item.shortViewCountText),
+      title: getText(item.title) || getText(item.headline) || 'Untitled',
+      channelTitle: getText(item.ownerText) || 
+                    getText(item.shortBylineText) || 
+                    getText(item.longBylineText) || 
+                    item.shortBylineText?.runs?.[0]?.text || 
+                    item.longBylineText?.runs?.[0]?.text || 
+                    'Unknown',
+      publishedText: getText(item.publishedTimeText) || '',
+      duration: getText(item.lengthText) || 
+                item.lengthText?.simpleText || 
+                item.thumbnailOverlays?.[0]?.thumbnailOverlayTimeStatusRenderer?.text?.simpleText || 
+                '',
+      viewCountText: getText(item.viewCountText || item.shortViewCountText) || '',
       thumbnails: item.thumbnail?.thumbnails || [],
       links: {
         watch: `https://www.youtube.com/watch?v=${item.videoId}`,

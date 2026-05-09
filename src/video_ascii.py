@@ -28,6 +28,12 @@ import argparse
 import sys
 import os
 import time
+import subprocess
+import signal
+
+# FFmpeg 멀티스레딩 충돌 방지 (Assertion fctx->async_lock failed 해결)
+os.environ["OPENCV_FFMPEG_THREADS"] = "1"
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "threads;1"
 import threading
 import queue
 import ctypes
@@ -524,6 +530,10 @@ class AsciiConverter:
         self._color_fn     = rgb_to_ansi_true if color_mode == "true" else rgb_to_ansi_256
         # 팔레트를 numpy 배열로 미리 변환 (빠른 인덱싱)
         self._palette_arr  = np.array(list(self.palette), dtype=object)
+        # 에지 검출 및 방향성 분석 옵션 (현재 비활성화: 클래식 모드)
+        self.edge_mode = False 
+        self.canny_low = 50
+        self.canny_high = 150
 
         # 터미널 크기 변경 감지 (SIGWINCH)
         self._term_cols, self._term_rows = get_terminal_size()
@@ -553,12 +563,63 @@ class AsciiConverter:
             return self.height
         return max(1, int(self.width * frame_h / frame_w * self.char_aspect))
 
+    def get_direction_char(self, angle: float) -> str:
+        """각도(0~360)에 따른 방향 문자 반환 (사용자 정의 매핑)"""
+        angle = angle % 180
+        if (0 <= angle < 22.5) or (157.5 <= angle <= 180):
+            return "|" # 0/180도 부근
+        elif 67.5 <= angle < 112.5:
+            return "-" # 90도 부근
+        elif 22.5 <= angle < 67.5:
+            return "\\" # 45도 부근 -> \
+        else:
+            return "/" # 135도 부근 -> /
+
     def convert_frame(self, frame: np.ndarray) -> str:
-        """프레임 → ANSI ASCII 문자열 (auto_size 포함 올인원)"""
+        """프레임 → 에지 기반 ANSI ASCII 문자열 (벡터화 최적화)"""
         h, w = frame.shape[:2]
-        self.update_dims_for_frame(h, w)   # ← 터미널 크기 자동 반영
-        rgb, idx = self.frame_to_arrays(frame)
-        return self.arrays_to_ansi_fast(rgb, idx)
+        self.update_dims_for_frame(h, w)
+        th = self._calc_height(h, w)
+        
+        # 1. 기본 리사이징 (컬러 정보 보존)
+        small_rgb = cv2.resize(frame, (self.width, th), interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(small_rgb, cv2.COLOR_BGR2GRAY)
+        
+        # 2. 에지 및 방향성 분석 (Sobel & Canny)
+        if self.edge_mode:
+            # Canny 에지 검출
+            edges = cv2.Canny(gray, self.canny_low, self.canny_high)
+            
+            # Sobel 그래디언트 분석
+            grad_x = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+            grad_y = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+            _, angles = cv2.cartToPolar(grad_x, grad_y, angleInDegrees=True)
+            
+            # 3. 벡터화된 문자 매핑 (NumPy 활용)
+            # 배경은 명암 팔레트로 미리 채움
+            idx = (gray / 255.0 * self.palette_len).astype(np.uint8)
+            char_map = np.array(list(self.palette), dtype='U1')
+            result_chars = char_map[idx]
+            
+            # 에지 영역에 방향 문자 덮어쓰기
+            edge_mask = edges > 0
+            if np.any(edge_mask):
+                ang = angles[edge_mask] % 180
+                
+                # 방향 판별 (사용자 요청 매핑: 45->\, 135->/)
+                dir_chars = np.full(ang.shape, "|", dtype='U1') 
+                dir_chars[(ang >= 67.5) & (ang < 112.5)] = "-"
+                dir_chars[(ang >= 22.5) & (ang < 67.5)] = "\\"
+                dir_chars[(ang >= 112.5) & (ang < 157.5)] = "/"
+                
+                result_chars[edge_mask] = dir_chars
+            
+            # 4. ANSI 컬러 조립
+            return self.arrays_to_ansi_fast(small_rgb, result_chars)
+        else:
+            # 기존 명암 모드
+            rgb, idx = self.frame_to_arrays(frame)
+            return self.arrays_to_ansi_fast(rgb, idx)
 
     # ── CUDA (PyTorch) ──────────────────────────
     def _process_cuda(self, frame: np.ndarray) -> np.ndarray:
@@ -674,8 +735,14 @@ class AsciiConverter:
         # 호환성을 위해 fast 버전으로 위임
         return self.arrays_to_ansi_fast(rgb, idx)
 
-    def arrays_to_ansi_fast(self, rgb: np.ndarray, idx: np.ndarray) -> str:
-        """벡터화된 빠른 ANSI 변환 (캐시 활용)"""
+    def arrays_to_ansi_fast(self, rgb: np.ndarray, chars_or_idx) -> str:
+        """벡터화된 빠른 ANSI 변환 (문자 배열 또는 인덱스 배열 지원)"""
+        if isinstance(chars_or_idx, np.ndarray) and chars_or_idx.dtype.kind == 'U':
+            # 에지 모드용 문자 직접 배열 처리
+            return self._build_ansi_from_chars(rgb, chars_or_idx)
+        
+        # 기존 인덱스 기반 처리
+        idx = chars_or_idx
         if self.color and self._backend == "cpp" and HAS_CPP_ENGINE and not self.invert and self.color_mode == "true":
             return cpp_engine.build_ansi(
                 rgb,
@@ -706,6 +773,45 @@ class AsciiConverter:
             self.color_levels,
             self.color_block_width,
         )
+
+    def _build_ansi_from_chars(self, rgb: np.ndarray, chars: np.ndarray) -> str:
+        """[신규] 직접적인 문자 배열을 사용한 고속 ANSI 생성"""
+        h, w = chars.shape
+        rgb = np.clip(rgb, 0, 255).astype(np.uint8)
+        rgb = _apply_color_block_width(rgb, self.color_block_width)
+        rgb = _quantize_truecolor_rgb(rgb, self.color_levels)
+        
+        color_fn = _rgb_to_ansi_true_cached if self.color_mode == "true" else _ansi_256_code_cached
+        
+        # 색상 변화 마스크
+        color_key_2d = (
+            (rgb[:, :, 2].astype(np.uint32) << 16)
+            | (rgb[:, :, 1].astype(np.uint32) << 8)
+            | rgb[:, :, 0].astype(np.uint32)
+        )
+        diff = np.ones((h, w), dtype=bool)
+        diff[:, 1:] = color_key_2d[:, 1:] != color_key_2d[:, :-1]
+        
+        lines = []
+        for y in range(h):
+            row_chars = chars[y]
+            row_keys = color_key_2d[y]
+            parts = []
+            prev_x = 0
+            for x in range(w):
+                if diff[y, x]:
+                    if x > prev_x:
+                        parts.append("".join(row_chars[prev_x:x]))
+                    if self.color_mode == "true":
+                        parts.append(color_fn(int(rgb[y, x, 2]), int(rgb[y, x, 1]), int(rgb[y, x, 0])))
+                    else:
+                        parts.append(color_fn(int(row_keys[x])))
+                    prev_x = x
+            if prev_x < w:
+                parts.append("".join(row_chars[prev_x:w]))
+            parts.append("\x1b[0m")
+            lines.append("".join(parts))
+        return "\n".join(lines)
 
 
 def benchmark_frame_convert(converter: "AsciiConverter", frame: np.ndarray, iterations: int = 30) -> dict:
@@ -1002,7 +1108,8 @@ class AsciiVideoPipeline:
         sys.stdout.flush()
 
     def run_terminal(self, source, fps_target: float = 30.0,
-                     hide_cursor: bool = True, loop: bool = False, suggestions: list = None):
+                     hide_cursor: bool = True, loop: bool = False, 
+                     suggestions: list = None, audio_url: str = None):
         """실시간 터미널 출력 (터미널 리사이즈 자동 대응)"""
         if hide_cursor:
             self._set_cursor_visible(False)
@@ -1011,10 +1118,20 @@ class AsciiVideoPipeline:
         frame_delay = 1.0 / fps_target
 
         while True:
-            cap = cv2.VideoCapture(source)
+            # 윈도우 환경에서 FFmpeg 안정성을 위해 속성 직접 지정
+            cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                # 실패 시 기본 백엔드로 재시도
+                cap = cv2.VideoCapture(source)
+            
             if not cap.isOpened():
                 print(f"[!] 소스를 열 수 없음: {source}")
                 return
+            
+            # 가속 및 지연 방지 설정
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except: pass
 
             fps_real = cap.get(cv2.CAP_PROP_FPS) or fps_target
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not webcam else -1
@@ -1024,6 +1141,23 @@ class AsciiVideoPipeline:
             self._reset_queue(fps_target, webcam)
             t = threading.Thread(target=self._producer, args=(cap,), daemon=True)
             t.start()
+
+            # 오디오 시작 (ffplay 활용)
+            audio_proc = None
+            if audio_url:
+                try:
+                    # ffplay -nodisp: 화면 없이, -autoexit: 종료 시 자동 닫힘, -vn: 비디오 제외
+                    cmd = ["ffplay", "-nodisp", "-autoexit", "-vn", "-loglevel", "quiet", audio_url]
+                    # 윈도우에서 콘솔 창이 뜨지 않도록 설정
+                    startupinfo = None
+                    if platform.system() == "Windows":
+                        startupinfo = subprocess.STARTUPINFO()
+                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                        startupinfo.wShowWindow = 0 # SW_HIDE
+                    
+                    audio_proc = subprocess.Popen(cmd, startupinfo=startupinfo)
+                except Exception as e:
+                    pass # ffplay가 없으면 소리 없이 진행
 
             if hide_cursor:
                 sys.stdout.write("\x1b[?25l")
@@ -1037,9 +1171,17 @@ class AsciiVideoPipeline:
                 drops_local = 0
                 fps_display = fps_target
                 t0 = time.perf_counter()
-                t_frame_start = t0  # 프레임 처리 시작 시간
+                t_start = t0  # 동기화 기준 시간
 
                 while True:
+                    # [동기화] 현재 시간에 맞춰야 할 기대 프레임 번호 계산 및 뒤처진 프레임 스킵
+                    expected_frame = int((time.perf_counter() - t_start) * fps_target)
+                    while frame_count < expected_frame:
+                        try:
+                            self._q.get_nowait()
+                            frame_count += 1
+                        except: break
+
                     # ── 프레임 시작 시점 기록 (sleep 계산 기준) ──────────────
                     t_frame_start = time.perf_counter()
 
@@ -1102,66 +1244,87 @@ class AsciiVideoPipeline:
                     max_allowed_rows = max(10, rows - 3)
                     
                     if (suggestions is not None) and cols >= 100:
-                        # 사이드바 너비를 남는 공간에 맞춰 정밀하게 계산 (최대 65)
-                        sidebar_w = min(65, cols - frame_w - 4)
+                        # 사이드바 너비를 남는 공간에 맞춰 더 보수적으로 계산 (여유 10칸 확보)
+                        sidebar_w = min(60, cols - frame_w - 10)
                         if sidebar_w < 20: 
                             sidebar_w = 0
                         
+                        # 사이드바 갱신 조건: 로딩된 섬네일 수 변경 or 터미널 너비 변경 or 애니메이션 틱(0.5초)
                         thumb_count = len(getattr(self, '_thumb_ascii_cache', {}))
+                        anim_tick = int(time.time() * 2) 
                         needs_refresh = (not hasattr(self, '_sidebar_cache') or 
                                          self._sidebar_cache_w != sidebar_w or 
-                                         getattr(self, '_last_thumb_count', -1) != thumb_count)
+                                         getattr(self, '_last_thumb_count', -1) != thumb_count or
+                                         getattr(self, '_last_anim_tick', -1) != anim_tick)
                         
-                        if needs_refresh:
+                        if needs_refresh and sidebar_w > 0:
                             self._sidebar_cache = self._render_sidebar_lines(suggestions, sidebar_w)
                             self._sidebar_cache_w = sidebar_w
                             self._last_thumb_count = thumb_count
+                            self._last_anim_tick = anim_tick
                         
                         v_lines = ascii_str.splitlines()
-                        s_lines = self._sidebar_cache
+                        s_lines = self._sidebar_cache if sidebar_w > 0 else []
                         
-                        merged = []
-                        max_l = min(max_allowed_rows, max(len(v_lines), len(s_lines)))
-                        merged = []
-                        max_l = min(max_allowed_rows, max(len(v_lines), len(s_lines)))
-                        for i in range(max_l):
-                            vl = v_lines[i] if i < len(v_lines) else ""
-                            sl = s_lines[i] if i < len(s_lines) else ""
-                            # \x1b[{n}G: 커서를 n번째 열로 이동 (하드웨어 가속 정렬)
-                            # 영상(vl) 출력 후 사이드바(sl)를 정확한 위치에 배치
-                            merged.append(f"{vl}\x1b[{frame_w + 3}G{sl}\x1b[K")
-                        ascii_str = "\n".join(merged)
-                        out_lines = max_l
+                        # ── 고성능 좌표 기반 렌더링 ────────────────────────────────────
+                        # 1. 영상을 먼저 홈 위치(\x1b[H)에서 출력
+                        v_output = "\x1b[H" + "\n".join([line + "\x1b[K" for line in v_lines[:max_allowed_rows]])
+                        sys.stdout.write(v_output)
+                        
+                        # 2. 사이드바를 절대 좌표로 덮어쓰기 (frame_w + 6 위치로 더 밀어냄)
+                        if sidebar_w > 0:
+                            sidebar_pos_x = frame_w + 6
+                            sidebar_output = []
+                            for i, sl in enumerate(s_lines[:max_allowed_rows]):
+                                # i+1 행, sidebar_pos_x 열로 커서 이동 후 출력
+                                sidebar_output.append(f"\x1b[{i+1};{sidebar_pos_x}H{sl}")
+                            sys.stdout.write("".join(sidebar_output))
+                        
+                        # 3. 상태바를 영상/사이드바 아래에 배치
+                        status_y = max(len(v_lines), len(s_lines)) + 1
+                        status_y = min(status_y, rows)
+                        sys.stdout.write(f"\x1b[{status_y};1H\x1b[38;2;0;255;0m{status}\x1b[0m\x1b[K")
+                        
+                        out_lines = max_allowed_rows
                     else:
-                        v_lines = ascii_str.splitlines()
-                        ascii_str = "\n".join([line + "\x1b[K" for line in v_lines[:max_allowed_rows]])
-                        out_lines = len(v_lines[:max_allowed_rows])
+                        v_lines = ascii_str.splitlines()[:max_allowed_rows]
+                        sys.stdout.write("\x1b[H" + "\n".join([line + "\x1b[K" for line in v_lines]))
+                        sys.stdout.write(f"\n\x1b[38;2;0;255;0m{status}\x1b[0m\x1b[K")
+                        out_lines = len(v_lines)
 
-                    # 한 번에 모든 출력 (홈 이동 + 상태바)
-                    # \x1b[0m으로 모든 색상 초기화 후 출력
-                    output = f"\x1b[H\x1b[0m{ascii_str}\n\x1b[38;2;0;255;0m{status}\x1b[0m\x1b[K"
-                    sys.stdout.write(output)
                     prev_out_lines = out_lines + 1
 
                     now = time.perf_counter()
                     fps_display = frame_count / (now - t0)
                     sys.stdout.flush()
 
-                    # ── FPS 제한: 프레임 시작 기준으로 deadline sleep ──────────────
+                    # [동기화] 소리보다 앞서가고 있을 때만 대기
                     elapsed_frame = now - t_frame_start
-                    sleep_t = frame_delay - elapsed_frame
+                    # 다음 프레임이 나와야 할 절대 시간과 현재 시간 비교
+                    next_expected_t = t_start + ((frame_count + 1) * frame_delay)
+                    sleep_t = next_expected_t - now
+                    
                     if sleep_t > 0.001:
-                        time.sleep(sleep_t)
+                        time.sleep(min(sleep_t, frame_delay))
 
             except KeyboardInterrupt:
                 print("\n[i] 중단됨")
+                self._stop.set()
             finally:
                 self._stop.set()
                 cap.release()
                 t.join(timeout=2)
-                if hide_cursor:
-                    self._set_cursor_visible(True) # 커서 복구
                 
+                if hide_cursor:
+                    self._set_cursor_visible(True)
+                    sys.stdout.write("\x1b[?25h")
+                
+                # 오디오 프로세스 종료
+                if audio_proc:
+                    try:
+                        audio_proc.terminate()
+                    except: pass
+            
             if not loop or webcam:
                 break
 
@@ -1176,15 +1339,29 @@ class AsciiVideoPipeline:
             self._thumb_loading_started = set()
 
         # 아직 로딩을 시작하지 않은 영상이 있다면 스레드 시작
-        has_new = any(s.get("id") and s.get("id") not in self._thumb_loading_started for s in suggestions[:8])
+        has_new = any(s.get("id") and s.get("id") not in getattr(self, '_thumb_loading_started', set()) for s in suggestions[:8])
         if has_new:
             threading.Thread(target=self._preload_thumbnails, args=(suggestions,), daemon=True).start()
 
-        # 너비 보정을 위해 텍스트 길이 정밀 계산
+        # 사이드바 각 라인을 조립하고 너비를 강제로 맞추는 도우미
+        def finalize_line(content_with_borders):
+            # 내용에서 ANSI 코드를 제외한 실제 시각적 길이를 계산
+            vlen = self._visual_len(content_with_borders)
+            # 부족한 만큼 공백을 채워 넣음 (오른쪽 테두리 바로 앞에 삽입)
+            if vlen < width:
+                gap = " " * (width - vlen)
+                # 마지막 '|' 앞에 공백 삽입
+                if content_with_borders.endswith("|\x1b[0m"):
+                    return content_with_borders[:-5] + gap + "|\x1b[0m"
+                return content_with_borders + gap
+            return content_with_borders
+
+        # 1. 헤더 렌더링
         title_text = "추천 영상"
         border = "\x1b[97m+" + "-" * (width - 2) + "+\x1b[0m"
         lines.append(border)
-        lines.append("\x1b[97;1m| " + self._visual_ljust(title_text, width - 4) + " |\x1b[0m")
+        header = "\x1b[97;1m| " + self._visual_ljust(title_text, width - 4) + " |\x1b[0m"
+        lines.append(finalize_line(header))
         lines.append(border)
         
         # 섬네일 크기 설정
@@ -1194,57 +1371,52 @@ class AsciiVideoPipeline:
         for idx, s in enumerate(suggestions[:6]):
             vid_id = s.get("id")
             title = s.get("title", "Untitled")
-            channel = s.get("channelTitle", "YouTube")
+            # 다양한 필드명에 대응하는 유연한 추출
+            channel = s.get("channelTitle") or s.get("author") or s.get("uploader") or "YouTube"
+            duration = s.get("duration") or s.get("lengthText") or s.get("length") or ""
             
             # 섬네일 ASCII 가져오기 (없으면 로딩 표시)
             if vid_id in getattr(self, '_thumb_ascii_cache', {}):
                 t_ascii = self._thumb_ascii_cache[vid_id]
             else:
-                # 로딩 애니메이션 효과 (프레임마다 점이 움직임)
+                # 고정 폭 로딩 애니메이션
                 dots = "." * (1 + (int(time.time() * 2) % 3))
-                t_ascii = [f" \x1b[90m[ 로딩중{dots.ljust(3)} ]\x1b[0m "] * thumb_h
+                t_ascii = [f" \x1b[90m[{'로딩중' + dots.ljust(3)}]\x1b[0m "] * thumb_h
             
-            # 제목 줄바꿈 (3줄까지 허용하여 짤림 방지)
+            # 제목 줄바꿈
             t_clean = _re.sub(r'\x1b\[[0-9;]*m', '', title)
             t_rows = []
-            curr = ""
-            curr_vlen = 0
+            curr = ""; curr_vlen = 0
+            max_t_w = width - thumb_w - 8
             for char in t_clean:
                 char_vlen = 2 if ord(char) > 0x7F else 1
-                if curr_vlen + char_vlen < width - thumb_w - 8:
-                    curr += char
-                    curr_vlen += char_vlen
+                if curr_vlen + char_vlen < max_t_w:
+                    curr += char; curr_vlen += char_vlen
                 else:
-                    t_rows.append(curr)
-                    curr = char
-                    curr_vlen = char_vlen
+                    t_rows.append(curr); curr = char; curr_vlen = char_vlen
             if curr: t_rows.append(curr)
             
-            # 1~3행: 섬네일 + 제목 (3줄로 확장)
+            # 1~3행: 섬네일 + 제목
             for i in range(3):
                 row_text = t_rows[i] if i < len(t_rows) else ""
                 content = self._visual_ljust(row_text, width - thumb_w - 6)
-                lines.append(f"\x1b[97m| {t_ascii[i]}  {content} |\x1b[0m")
+                lines.append(finalize_line(f"\x1b[97m| {t_ascii[i]}  {content} |\x1b[0m"))
             
-            # 4행: 섬네일 + 채널명 & 영상 길이
+            # 4행: 섬네일 + 채널 & 길이
             c_clean = _re.sub(r'\x1b\[[0-9;]*m', '', channel)
-            duration = s.get("duration", "")
-            
-            # 채널명과 길이를 조합 (길이는 노란색 강조)
             if duration:
-                # 채널명이 너무 길면 잘라냄
                 avail_w = width - thumb_w - 15
                 info_text = f"{c_clean[:avail_w]} \x1b[93m[{duration}]\x1b[0m"
             else:
                 info_text = c_clean
-                
             c_content = self._visual_ljust(info_text, width - thumb_w - 6)
-            lines.append(f"\x1b[97m| {t_ascii[3]}  \x1b[36m{c_content}\x1b[0m |\x1b[0m")
+            lines.append(finalize_line(f"\x1b[97m| {t_ascii[3]}  \x1b[36m{c_content}\x1b[0m |\x1b[0m"))
             
             # 5행: 섬네일 나머지
-            lines.append(f"\x1b[97m| {t_ascii[4]}  {' ' * (width - thumb_w - 6)} |\x1b[0m")
+            empty_space = self._visual_ljust("", width - thumb_w - 6)
+            lines.append(finalize_line(f"\x1b[97m| {t_ascii[4]}  {empty_space} |\x1b[0m"))
                 
-            lines.append("\x1b[97m|" + " " * (width - 2) + "|\x1b[0m")
+            lines.append(finalize_line("\x1b[97m|" + " " * (width - 2) + "|\x1b[0m"))
             
         lines.append(border)
         return lines
@@ -1288,15 +1460,21 @@ class AsciiVideoPipeline:
             for url in urls:
                 if not url: continue
                 try:
+                    # SSL 검증 우회 및 타임아웃/헤더 최적화
                     req = urllib.request.Request(url, headers={
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8'
                     })
-                    with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+                    with urllib.request.urlopen(req, timeout=8, context=ctx) as resp:
                         if resp.status != 200: continue
-                        img_array = np.asarray(bytearray(resp.read()), dtype=np.uint8)
+                        data = resp.read()
+                        if not data or len(data) < 100: continue
+                        
+                        img_array = np.asarray(bytearray(data), dtype=np.uint8)
                         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
                         if img is None: continue
                         
+                        # 사이드바용 12x5 고품질 리사이징
                         small = cv2.resize(img, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
                         ascii_rows = []
                         for y in range(thumb_h):
@@ -1304,13 +1482,14 @@ class AsciiVideoPipeline:
                             for x in range(thumb_w):
                                 b, g, r = small[y, x]
                                 gray = int(0.299 * r + 0.587 * g + 0.114 * b)
-                                char = " .:-=+*#%@"[min(9, gray // 26)]
+                                char = self.palette[min(self.palette_len, int(gray / 255.0 * self.palette_len))]
+                                # 각 픽셀에 True Color 입히기
                                 row_ansi += f"\x1b[38;2;{r};{g};{b}m{char}"
                             ascii_rows.append(row_ansi + "\x1b[0m")
                         
                         self._thumb_ascii_cache[vid_id] = ascii_rows
-                        break # 성공하면 다음 영상으로
-                except:
+                        break 
+                except Exception:
                     continue
             time.sleep(0.1) # 서버 부하 방지 및 안정성
 
@@ -1452,6 +1631,7 @@ class YtDlpSource:
         # 해상도 우선 포맷 선택
         fmts = info.get("formats", [])
         # 비디오 있고 height ≤ quality인 포맷만 추려서 height 내림차순
+        # [안정성 패치] H.264(avc1) 코덱을 최우선으로 선택 (VP9/AV1 충돌 방지)
         candidates = [
             f for f in fmts
             if f.get("vcodec", "none") != "none"
@@ -1459,8 +1639,18 @@ class YtDlpSource:
             and f.get("height") <= self.quality
             and f.get("url")
         ]
+        
         if candidates:
-            best = max(candidates, key=lambda f: (f.get("height", 0), f.get("tbr", 0)))
+            # 코덱 안정성 가중치 부여 (h264/avc1 > 그 외)
+            def codec_priority(f):
+                vcodec = f.get("vcodec", "").lower()
+                ext = f.get("ext", "").lower()
+                p = 0
+                if "avc1" in vcodec or "h264" in vcodec: p += 100
+                if ext == "mp4": p += 10
+                return (p, f.get("height", 0), f.get("tbr", 0))
+            
+            best = max(candidates, key=codec_priority)
         else:
             # quality보다 큰 것 중 가장 작은 것
             over = [f for f in fmts if f.get("vcodec","none") != "none" and f.get("url")]
@@ -1477,6 +1667,27 @@ class YtDlpSource:
             return info["url"]
 
         raise RuntimeError("재생 가능한 스트림 URL을 찾지 못했습니다.")
+    def get_audio_url(self, info: dict = None) -> str:
+        """
+        오디오 전용 스트림 URL 반환 (ffplay 재생용).
+        """
+        if info is None:
+            info = self.get_info()
+
+        fmts = info.get("formats", [])
+        # 오디오만 있고 url이 있는 포맷 중 가장 좋은 것 선택
+        audio_fmts = [
+            f for f in fmts
+            if f.get("vcodec") == "none" and f.get("acodec") != "none" and f.get("url")
+        ]
+        
+        if audio_fmts:
+            # m4a(aac) 선호 (ffplay 호환성)
+            best_audio = max(audio_fmts, key=lambda f: (f.get("ext") == "m4a", f.get("abr", 0)))
+            return best_audio["url"]
+        
+        # 없으면 비디오 포함 포맷이라도 사용
+        return info.get("url")
 
     # ── 파일 다운로드 (HTML/MP4 내보내기용) ────
     def download(self, info: dict = None) -> str:
@@ -1737,11 +1948,17 @@ def main():
                 try:
                     import json
                     suggestions = json.loads(args.suggestions)
-                except:
-                    pass
-            
+                except: pass
+
+            audio_url = None
+            if args.url:
+                try:
+                    # 정보(info)는 이미 앞에서 로딩됨
+                    audio_url = yt_source.get_audio_url(info)
+                except: pass
+
             print("Ctrl+C 로 종료\n")
-            pipeline.run_terminal(source, fps_target, loop=args.loop, suggestions=suggestions)
+            pipeline.run_terminal(source, fps_target, loop=args.loop, suggestions=suggestions, audio_url=audio_url)
     finally:
         # URL 다운로드 임시 파일 정리
         if needs_cleanup and yt_source:
