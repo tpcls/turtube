@@ -160,6 +160,7 @@ async function getVideo(reqUrl, res) {
   const watchUrl = `https://www.youtube.com/watch?v=${id}&hl=ko&gl=KR`;
   const [html, oembed] = await Promise.all([fetchText(watchUrl), getOembed(id)]);
   const playerResponse = parseJsonAfter(html, 'ytInitialPlayerResponse');
+  const initialData = parseJsonAfter(html, 'ytInitialData');
 
   if (!playerResponse?.videoDetails) {
     sendJson(res, 404, {
@@ -169,9 +170,25 @@ async function getVideo(reqUrl, res) {
     return;
   }
 
+  const suggestions = [];
+  if (initialData) {
+    // Try specifically for watch page secondary results first
+    const secondary = initialData.contents?.twoColumnWatchNextResults?.secondaryResults?.secondaryResults?.results;
+    if (Array.isArray(secondary)) {
+      for (const item of secondary) {
+        collectSearchVideos(item, suggestions, new Set([id]));
+      }
+    }
+    // Fallback to recursive search if empty
+    if (suggestions.length === 0) {
+      collectSearchVideos(initialData, suggestions, new Set([id]));
+    }
+  }
+
   sendJson(res, 200, {
     video: {
       ...compactVideoDetails(playerResponse.videoDetails, playerResponse.microformat),
+      suggestions: suggestions.slice(0, 8),
       oembed: oembed
         ? {
             title: oembed.title,
@@ -195,38 +212,42 @@ async function getVideo(reqUrl, res) {
 function collectSearchVideos(node, videos, seen) {
   if (!node || typeof node !== 'object') return;
 
-  if (node.videoRenderer?.videoId && !seen.has(node.videoRenderer.videoId)) {
-    const item = node.videoRenderer;
+  // Search for any known video renderer types
+  const item = node.videoRenderer || node.compactVideoRenderer || node.gridVideoRenderer || node.playlistVideoRenderer;
+  
+  if (item && item.videoId && !seen.has(item.videoId)) {
     seen.add(item.videoId);
     videos.push({
       id: item.videoId,
       title: getText(item.title),
-      description: getText(item.detailedMetadataSnippets?.[0]?.snippetText),
-      channelTitle: getText(item.ownerText),
+      channelTitle: getText(item.ownerText || item.shortBylineText || item.longBylineText),
       publishedText: getText(item.publishedTimeText),
       lengthText: getText(item.lengthText),
-      viewCountText: getText(item.viewCountText),
+      viewCountText: getText(item.viewCountText || item.shortViewCountText),
       thumbnails: item.thumbnail?.thumbnails || [],
       links: {
         watch: `https://www.youtube.com/watch?v=${item.videoId}`,
         embed: `https://www.youtube.com/embed/${item.videoId}`
       }
     });
-    return;
+    // We found a video, but we should still look into its children for more?
+    // Usually not needed for these renderers.
   }
 
-  for (const value of Object.values(node)) {
-    if (Array.isArray(value)) {
-      for (const child of value) collectSearchVideos(child, videos, seen);
-    } else if (value && typeof value === 'object') {
-      collectSearchVideos(value, videos, seen);
+  // Recursive search
+  if (Array.isArray(node)) {
+    for (const child of node) collectSearchVideos(child, videos, seen);
+  } else {
+    for (const key in node) {
+      if (key === 'videoDetails' || key === 'playerConfig') continue; // Skip large unrelated blocks
+      collectSearchVideos(node[key], videos, seen);
     }
   }
 }
 
 async function searchVideos(reqUrl, res) {
   const q = reqUrl.searchParams.get('q');
-  const maxResults = Math.min(Number(reqUrl.searchParams.get('maxResults') || 10), 25);
+  const maxResults = Math.min(Number(reqUrl.searchParams.get('maxResults') || 10), 100);
 
   if (!q) {
     sendJson(res, 400, { error: 'Provide a q query parameter.' });

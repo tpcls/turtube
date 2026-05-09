@@ -26,10 +26,12 @@ YouTube 공식 Data API 키는 필요하지 않습니다.
 - Node.js 18 이상
 - Python 3.9 이상
 - `ffmpeg`
-- macOS 또는 Linux 권장
+- macOS 또는 Linux 권장 (Windows 지원 포함)
 - 선택 사항: Homebrew, NVIDIA GPU/CUDA, Apple Silicon MLX
 
 ## 설치
+
+### macOS / Linux
 
 Python ASCII 변환기를 쓰려면 설치 스크립트를 실행합니다.
 
@@ -45,6 +47,20 @@ Python ASCII 변환기를 쓰려면 설치 스크립트를 실행합니다.
 - `ffmpeg` 설치 여부 확인
 - `src/ascii_engine.cpp`를 `build/libascii_engine.so`로 빌드
 - `run_ascii.sh` 실행 래퍼 생성
+
+### Windows
+
+```bat
+scripts\install.bat
+```
+
+Windows 설치 스크립트는 다음 작업을 수행합니다.
+
+- `venv_ascii` 가상환경 생성
+- `opencv-python-headless`, `numpy`, `Pillow`, `yt-dlp`, `numba` 설치
+- NVIDIA GPU 감지 시 CUDA 버전에 맞는 `torch`/`cupy` 자동 설치
+- `src/ascii_engine.cpp`를 `build/ascii_engine.dll`로 빌드 (MSVC 또는 MinGW)
+- `run_ascii.bat` 실행 래퍼 생성
 
 Node API 서버는 별도 패키지 의존성이 없습니다.
 
@@ -107,6 +123,8 @@ curl "http://127.0.0.1:3000/api/youtube/search?q=nodejs&maxResults=5"
 
 ## 영상 ASCII 변환기 사용법
 
+### macOS / Linux
+
 설치 후 `run_ascii.sh`를 사용합니다.
 
 YouTube URL 실시간 재생:
@@ -137,6 +155,34 @@ URL을 MP4로 저장:
 
 ```bash
 ./run_ascii.sh --webcam --width 120 --color
+```
+
+### Windows
+
+설치 후 `run_ascii.bat`를 사용합니다.
+
+YouTube URL 실시간 재생:
+
+```bat
+run_ascii.bat --url "https://youtu.be/dQw4w9WgXcQ" --width 160 --color
+```
+
+URL을 HTML로 저장:
+
+```bat
+run_ascii.bat --url "https://youtu.be/dQw4w9WgXcQ" --width 200 --output out.html --color
+```
+
+로컬 파일 재생:
+
+```bat
+run_ascii.bat --input video.mp4 --width 160 --color
+```
+
+웹캠 입력:
+
+```bat
+run_ascii.bat --webcam --width 120 --color
 ```
 
 주요 옵션:
@@ -172,7 +218,7 @@ npm start
 검색 화면:
 
 ```bash
-./run_youtube_ascii.sh --search "lofi hip hop" --max-results 8 --color always
+./run_youtube_ascii.sh --search "lofi hip hop" --max-results 9 --color always
 ```
 
 영상 상세 화면:
@@ -195,11 +241,27 @@ API 서버 주소를 바꾼 경우:
 
 ## C++ 엔진만 다시 빌드
 
+### macOS / Linux
+
 ```bash
 ./scripts/build_cpp.sh
 ```
 
 macOS에서 OpenMP를 사용하려면 Homebrew와 `libomp`가 필요합니다. 스크립트가 가능한 경우 자동으로 설치를 시도합니다.
+
+### Windows
+
+```bat
+scripts\build_cpp.bat
+```
+
+Windows에서는 다음 컴파일러 중 하나가 필요합니다:
+
+- **Visual Studio 2019/2022** (C++ 빌드 도구 포함) — MSVC, 자동 감지
+- **MSYS2 + MinGW-w64** — `pacman -S mingw-w64-x86_64-gcc` 후 `g++.exe`를 PATH에 추가
+- **WinLibs** — https://winlibs.com/ 에서 독립 MinGW 다운로드
+
+빌드 결과물: `build\ascii_engine.dll`
 
 ## 벤치마크
 
@@ -220,12 +282,16 @@ python tests/bench_perf.py
 │   ├── youtube_html_ascii.py  # YouTube 스타일 ASCII UI 렌더러
 │   └── ascii_engine.cpp       # C++ 변환 엔진
 ├── scripts/
-│   ├── install.sh             # 자동 설치 스크립트
-│   └── build_cpp.sh           # C++ 엔진 빌드
+│   ├── install.sh             # 자동 설치 스크립트 (macOS/Linux)
+│   ├── install.bat            # 자동 설치 스크립트 (Windows)
+│   ├── build_cpp.sh           # C++ 엔진 빌드 (macOS/Linux)
+│   └── build_cpp.bat          # C++ 엔진 빌드 (Windows)
 ├── tests/
 │   └── bench_perf.py          # 성능 벤치마크
-├── run_ascii.sh               # 영상 ASCII 변환기 실행 래퍼
-├── run_youtube_ascii.sh       # ASCII UI 렌더러 실행 래퍼
+├── run_ascii.sh               # 영상 ASCII 변환기 실행 래퍼 (macOS/Linux)
+├── run_ascii.bat              # 영상 ASCII 변환기 실행 래퍼 (Windows)
+├── run_youtube_ascii.sh       # ASCII UI 렌더러 실행 래퍼 (macOS/Linux)
+├── run_youtube_ascii.bat      # ASCII UI 렌더러 실행 래퍼 (Windows)
 ├── package.json
 └── .env.example
 ```

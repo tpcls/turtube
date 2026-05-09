@@ -5,13 +5,27 @@ import argparse
 import html
 import io
 import json
+import math
+import os
 import re
 import shutil
+import subprocess
 import sys
 import textwrap
+import time
+import threading
+import unicodedata
 import urllib.parse
 import urllib.request
 from typing import Any
+
+if sys.platform == "win32":
+    import msvcrt
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 
 USER_AGENT = (
@@ -19,6 +33,9 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
+ANSI_RE = re.compile(r"\033\[[0-9;?]*[a-zA-Z]")
+TEXT_BORDER_CODEPOINTS = {0x7C, 0x2223, 0x2502, 0x2503, 0xFF5C}
+TEXT_RIGHT_GUARD = 4
 
 
 RESET = "\033[0m"
@@ -33,7 +50,7 @@ COLORS = {
     "bright_red": "\033[91m",
     "bright_white": "\033[97m",
 }
-_THUMBNAIL_ASCII_CACHE: dict[tuple[str, int, int], list[str]] = {}
+_THUMBNAIL_ASCII_CACHE: dict[tuple[str, int, int, str], list[str]] = {}
 
 
 def paint(text: str, color: str) -> str:
@@ -41,19 +58,39 @@ def paint(text: str, color: str) -> str:
 
 
 def colorize_ascii(ascii_ui: str) -> str:
+    # Pre-compiled combined regex for common YouTube UI elements
+    # Using a single regex to match multiple tokens at once for speed
+    UI_TOKENS = re.compile(
+        r"(\[>\] YouTube|\[YOUTUBE\]|YouTube)|"
+        r"(\[play\]|\[ PLAY \])|"
+        r"(\[user\])|"
+        r"(\[\+\]|\[Upload\]|\[ Like \]|\[ Share \]|\[ Save \]|\[ Subscribe \])|"
+        r"(\d[\d,.KM]* views?|\d+:\d+|LIVE|Live|Metadata unavailable)|"
+        r"(@[\w_]+)"
+    )
+
+    def token_replacer(match):
+        if match.group(1): return paint(match.group(1), "bright_red")
+        if match.group(2): return paint(match.group(2), "green")
+        if match.group(3): return paint(match.group(3), "cyan")
+        if match.group(4): return paint(match.group(4), "blue")
+        if match.group(5): return paint(match.group(5), "magenta")
+        if match.group(6): return paint(match.group(6), "cyan")
+        return match.group(0)
+
     colored_lines = []
     for line in ascii_ui.splitlines():
         if set(line.strip()) <= {"+", "-", "=", "|"}:
             colored_lines.append(paint(line, "bright_black"))
             continue
 
-        line = re.sub(r"(\[>\] YouTube|\[YOUTUBE\]|YouTube)", lambda m: paint(m.group(1), "bright_red"), line)
-        line = re.sub(r"(\[play\]|\[ PLAY \])", lambda m: paint(m.group(1), "green"), line)
-        line = re.sub(r"(\[user\])", lambda m: paint(m.group(1), "cyan"), line)
-        line = re.sub(r"(\[\+\]|\[Upload\]|\[ Like \]|\[ Share \]|\[ Save \]|\[ Subscribe \])", lambda m: paint(m.group(1), "blue"), line)
-        line = re.sub(r"(\d[\d,.KM]* views?|\d+:\d+|LIVE|Live|Metadata unavailable)", lambda m: paint(m.group(1), "magenta"), line)
-        line = re.sub(r"(@[\w_]+)", lambda m: paint(m.group(1), "cyan"), line)
-        colored_lines.append(line)
+        if "\033[90m" in line: # bright_black (selection)
+            # Still apply some colors inside selection? 
+            # For now keep it simple to avoid over-complicating selection logic
+            colored_lines.append(line)
+            continue
+            
+        colored_lines.append(UI_TOKENS.sub(token_replacer, line))
     return "\n".join(colored_lines)
 
 
@@ -92,26 +129,27 @@ def fetch_json(url: str, timeout: float = 20.0) -> dict[str, Any]:
 
 
 def fetch_thumbnail_ascii(url: str, width: int, height: int) -> list[str]:
-    if not url or width <= 0 or height <= 0:
+    if not url or width <= 0 or height <= 0 or Image is None:
         return []
-    cache_key = (url, width, height)
+    cache_key = (url, width, height, "color")
     if cache_key in _THUMBNAIL_ASCII_CACHE:
         return _THUMBNAIL_ASCII_CACHE[cache_key]
     try:
-        from PIL import Image
-
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         with urllib.request.urlopen(req, timeout=8.0) as resp:
-            image = Image.open(io.BytesIO(resp.read())).convert("L")
-        image = image.resize((width, height))
+            image = Image.open(io.BytesIO(resp.read())).convert("RGB")
+        image = image.resize((width, height), Image.Resampling.LANCZOS)
+
         ramp = " .:-=+*#%@"
         rows = []
         for y in range(height):
-            chars = []
+            line_parts = []
             for x in range(width):
-                value = image.getpixel((x, y))
-                chars.append(ramp[value * (len(ramp) - 1) // 255])
-            rows.append("".join(chars))
+                r, g, b = image.getpixel((x, y))
+                gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+                char = ramp[gray * (len(ramp) - 1) // 255]
+                line_parts.append(f"\033[38;2;{r};{g};{b}m{char}\033[0m")
+            rows.append("".join(line_parts))
     except Exception:
         rows = []
     _THUMBNAIL_ASCII_CACHE[cache_key] = rows
@@ -153,20 +191,30 @@ def format_duration(seconds: Any) -> str:
 
 def format_view_count(value: Any) -> str:
     try:
+        # Handle strings with commas or already formatted strings
+        if isinstance(value, str):
+            value = "".join(filter(str.isdigit, value))
         count = int(value)
     except (TypeError, ValueError):
-        return ""
-    if count >= 1_000_000_000:
-        return f"{count / 1_000_000_000:.1f}B views"
-    if count >= 1_000_000:
-        return f"{count / 1_000_000:.1f}M views"
+        return str(value) if value else ""
+
+    if count >= 100_000_000:
+        return f"{count / 100_000_000:.1f}억"
+    if count >= 10_000:
+        return f"{count / 10_000:.1f}만"
     if count >= 1_000:
-        return f"{count / 1_000:.1f}K views"
-    return f"{count} views"
+        return f"{count / 1_000:.1f}천"
+    return str(count)
 
 
 def normalize_api_video(item: dict[str, Any]) -> dict[str, str]:
-    views = clean_text(item.get("viewCountText", "")) or format_view_count(item.get("viewCount"))
+    raw_views = item.get("viewCountText", "") or str(item.get("viewCount") or "")
+    views = format_view_count(raw_views)
+    if "시청" in str(item.get("viewCountText", "")):
+        views += "명 시청 중"
+    elif views:
+        views = "조회수 " + views + "회"
+        
     published = clean_text(item.get("publishedText", ""))
     meta = " | ".join(part for part in [views, published] if part)
     return {
@@ -205,7 +253,7 @@ def fetch_api_video(api_base: str, raw_input: str) -> dict[str, Any]:
         "length": normalized["length"],
         "description": clean_text(video.get("description", "")),
         "thumbnail": normalized["thumbnail"] or clean_text(video.get("oembed", {}).get("thumbnailUrl", "")),
-        "suggestions": [],
+        "suggestions": video.get("suggestions", []),
     }
 
 
@@ -258,9 +306,20 @@ def meta_content(page_html: str, key: str, attr: str = "property") -> str:
 
 
 def clean_text(value: str) -> str:
-    value = html.unescape(value or "")
+    if not value:
+        return ""
+    # If it contains ANSI escape codes, don't unescape/sub space to avoid mangling
+    if "\033[" in value:
+        return value
+    value = html.unescape(value)
     value = re.sub(r"\s+", " ", value)
     return value.strip()
+
+
+def clean_cell_text(value: str) -> str:
+    text = clean_text(value)
+    text = "".join(" / " if ord(char) in TEXT_BORDER_CODEPOINTS else char for char in text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def first_text(run_container: Any) -> str:
@@ -338,6 +397,67 @@ def parse_watch_page(page_html: str) -> dict[str, Any]:
     }
 
 
+def get_char_width(char: str) -> int:
+    cp = ord(char)
+    # Non-spacing marks, Variation selectors, etc.
+    if unicodedata.category(char) in ("Mn", "Me", "Cf") or 0xFE00 <= cp <= 0xFE0F:
+        return 0
+    # East Asian Wide or Fullwidth
+    if unicodedata.east_asian_width(char) in ("W", "F"):
+        return 2
+    # Common Emoji ranges & Symbols (Miscellaneous Symbols, Dingbats, etc.)
+    if 0x1F300 <= cp <= 0x1F9FF or 0x2600 <= cp <= 0x27BF or 0x2300 <= cp <= 0x23FF:
+        return 2
+    # Mathematical Alphanumeric Symbols (e.g. 𝐏𝐥𝐚𝐲𝐥𝐢𝐬𝐭)
+    # Often rendered as 2-width in CJK terminals due to font substitution
+    if 0x1D400 <= cp <= 0x1D7FF:
+        return 2
+    # Check if it's a known narrow character that might be misclassified
+    if cp < 128:
+        return 1
+    return 1
+
+
+def get_display_width(text: str) -> int:
+    # Strip ANSI codes before calculating width
+    clean_text_for_width = ANSI_RE.sub("", text)
+    return sum(get_char_width(char) for char in clean_text_for_width)
+
+
+def visual_crop(text: str, max_width: int) -> str:
+    current_width = 0
+    result = []
+    
+    # Process characters, but handle ANSI escape sequences separately
+    i = 0
+    while i < len(text):
+        if text[i : i + 2] == "\033[":
+            # Find end of ANSI sequence
+            end = text.find("m", i)
+            if end != -1:
+                result.append(text[i : end + 1])
+                i = end + 1
+                continue
+            elif (end := text.find("K", i)) != -1:
+                result.append(text[i : end + 1])
+                i = end + 1
+                continue
+        
+        char = text[i]
+        w = get_char_width(char)
+        if current_width + w > max_width:
+            break
+        result.append(char)
+        current_width += w
+        i += 1
+        
+    # Ensure we don't leave a dangling ANSI sequence and always end with RESET if ANSI was present
+    res = "".join(result)
+    if "\033[" in text and not res.endswith("\033[0m"):
+        res += "\033[0m"
+    return res
+
+
 def box_line(width: int, fill: str = " ") -> str:
     return "|" + (fill * max(0, width - 2)) + "|"
 
@@ -346,7 +466,9 @@ def fit(text: str, width: int) -> str:
     if width <= 0:
         return ""
     text = clean_text(text)
-    return text[:width].ljust(width)
+    visible_text = visual_crop(text, width)
+    visible_w = get_display_width(visible_text)
+    return visible_text + (" " * (width - visible_w))
 
 
 def fit_left_right(left: str, right: str, width: int) -> str:
@@ -354,12 +476,16 @@ def fit_left_right(left: str, right: str, width: int) -> str:
         return ""
     left = clean_text(left)
     right = clean_text(right)
-    if len(right) >= width:
-        return right[-width:]
-    gap = width - len(left) - len(right)
-    if gap < 1:
-        left = left[: max(0, width - len(right) - 1)].rstrip()
-        gap = width - len(left) - len(right)
+    
+    right_w = get_display_width(right)
+    if right_w >= width:
+        return visual_crop(right, width)
+    
+    left_max_w = width - right_w - 1
+    left = visual_crop(left, left_max_w)
+    left_w = get_display_width(left)
+    
+    gap = width - left_w - right_w
     return left + (" " * max(1, gap)) + right
 
 
@@ -367,11 +493,53 @@ def wrap_lines(text: str, width: int, max_lines: int) -> list[str]:
     text = clean_text(text)
     if not text:
         return []
-    lines = textwrap.wrap(text, width=max(1, width), break_long_words=True, break_on_hyphens=False)
+    
+    # Custom wrap for visual width
+    lines = []
+    current_line = []
+    current_w = 0
+    
+    words = text.split(" ")
+    for word in words:
+        word_w = get_display_width(word)
+        if not current_line:
+            if word_w > width:
+                # Long word, break it
+                temp_word = ""
+                temp_w = 0
+                for char in word:
+                    cw = get_char_width(char)
+                    if temp_w + cw > width:
+                        lines.append(temp_word)
+                        temp_word = char
+                        temp_w = cw
+                    else:
+                        temp_word += char
+                        temp_w += cw
+                current_line = [temp_word]
+                current_w = temp_w
+            else:
+                current_line = [word]
+                current_w = word_w
+        else:
+            if current_w + 1 + word_w > width:
+                lines.append(" ".join(current_line))
+                current_line = [word]
+                current_w = word_w
+            else:
+                current_line.append(word)
+                current_w += 1 + word_w
+                
+    if current_line:
+        lines.append(" ".join(current_line))
+
     if len(lines) > max_lines:
         lines = lines[:max_lines]
         if width > 3:
-            lines[-1] = lines[-1][: width - 3].rstrip() + "..."
+            last = lines[-1]
+            while get_display_width(last) > width - 3:
+                last = last[:-1]
+            lines[-1] = last.rstrip() + "..."
     return lines
 
 
@@ -415,6 +583,24 @@ def sample_home_data() -> dict[str, Any]:
                 "meta": "2.4M views | 8 months ago",
                 "length": "31:45",
             },
+            {
+                "title": "Terminal setup for focused work",
+                "channel": "Shell Notes",
+                "meta": "132K views | 6 days ago",
+                "length": "14:20",
+            },
+            {
+                "title": "Why text UIs still feel fast",
+                "channel": "Latency Lab",
+                "meta": "256K views | 2 weeks ago",
+                "length": "11:07",
+            },
+            {
+                "title": "Building a tiny recommendation feed",
+                "channel": "Backend Bits",
+                "meta": "77K views | month ago",
+                "length": "22:36",
+            },
         ],
     }
 
@@ -438,11 +624,12 @@ def sample_watch_data() -> dict[str, Any]:
     }
 
 
-def border(width: int, char: str = "-") -> str:
-    return "+" + char * max(0, width - 2) + "+"
+def border(width: int, char: str = "-", color: str | None = None) -> str:
+    b = "+" + char * max(0, width - 2) + "+"
+    return paint(b, color) if color else b
 
 
-def nav_bar(width: int, selected: str = "Home") -> list[str]:
+def nav_bar(width: int, selected: str = "Home", selected_id: str = "") -> list[str]:
     logo = " [>] YouTube "
     inner_w = max(1, width - 2)
     right = "[+] [user]"
@@ -450,12 +637,22 @@ def nav_bar(width: int, selected: str = "Home") -> list[str]:
     search = ""
     if available_search_w >= 12:
         search_w = min(42, available_search_w)
-        search = "[ Search " + "_" * max(2, search_w - 10) + " ]"
+        search_text = " Search " + "_" * max(2, search_w - 10) + " "
+        if selected_id == "search":
+            search_text = paint(search_text, "bright_black")
+        search = "[" + search_text + "]"
     line = fit_left_right(logo + search, right, inner_w)
-    tabs = "  ".join(
-        ("[" + item + "]") if item == selected else item
-        for item in ["Home", "Shorts", "Subscriptions", "Library"]
-    )
+    tab_list = ["Home", "Subscriptions", "Library"]
+    tab_parts = []
+    for i, item in enumerate(tab_list):
+        text = item
+        if selected_id == f"tab_{i}":
+            text = paint(text, "bright_black")
+        if item == selected:
+            tab_parts.append("[" + text + "]")
+        else:
+            tab_parts.append(text)
+    tabs = "  ".join(tab_parts)
     return [
         border(width, "="),
         "|" + line + "|",
@@ -468,56 +665,72 @@ def render_ascii_thumbnail(
     width: int,
     height: int,
     label: str,
-    title: str = "",
-    meta: str = "",
     thumbnail_url: str = "",
+    selected: bool = False,
 ) -> list[str]:
-    lines = [border(width)]
+    b_color = "bright_black" if selected else None
+    lines = [border(width, color=b_color)]
     inner_w = max(1, width - 2)
     label = clean_text(label)
+    if selected:
+        label = paint(label, "bright_black")
     if label:
         label = label[: max(1, inner_w - 2)]
     overlay: dict[int, str] = {}
     if thumbnail_url:
-        title_start = max(1, height - 5)
-        thumbnail_rows = fetch_thumbnail_ascii(thumbnail_url, inner_w, max(1, title_start - 1))
+        thumbnail_rows = fetch_thumbnail_ascii(thumbnail_url, inner_w, max(1, height - 2))
         if thumbnail_rows:
             for offset, thumbnail_line in enumerate(thumbnail_rows):
                 overlay[1 + offset] = thumbnail_line
         else:
             overlay[1] = "[thumbnail]"
             overlay[2] = thumbnail_url
-    if title:
-        title_rows = wrap_lines(title, inner_w, 2)
-        title_start = max(1, height - 5)
-        for offset, title_line in enumerate(title_rows):
-            overlay[title_start + offset] = title_line
-    if meta:
-        overlay[height - 3] = meta
     for row in range(1, height - 1):
+        side = paint("|", "bright_black") if selected else "|"
         if row in overlay:
-            lines.append("|" + fit(overlay[row], inner_w) + "|")
+            content = overlay[row]
+            lines.append(side + fit(content, inner_w) + side)
         elif label and row == height - 2:
-            content = label.rjust(inner_w)
-            lines.append("|" + content + "|")
+            lines.append(side + fit(label.rjust(inner_w), inner_w) + side)
         else:
-            lines.append(box_line(width))
-    lines.append(border(width))
+            lines.append(side + (" " * inner_w) + side)
+    lines.append(border(width, color=b_color))
     return lines
 
 
-def render_video_card(item: dict[str, str], width: int, index: int, thumb_height: int = 9) -> list[str]:
+def render_video_card(item: dict[str, str], width: int, index: int, thumb_height: int = 9, selected: bool = False) -> list[str]:
     lines = render_ascii_thumbnail(
         width,
         thumb_height,
         item.get("length", ""),
-        item.get("title", ""),
-        item.get("views", "") or item.get("meta", ""),
         item.get("thumbnail", ""),
+        selected=selected
     )
     inner_w = max(1, width - 2)
-    lines.append("|" + fit(f"{index:>2}. " + item.get("channel", "YouTube"), inner_w) + "|")
-    lines.append(border(width))
+    title = clean_cell_text(item.get("title", "Untitled"))
+    channel = clean_cell_text(item.get("channel", "YouTube"))
+    meta = clean_cell_text(item.get("views", "") or item.get("meta", ""))
+    
+    side = paint("|", "bright_black") if selected else "|"
+    text_w = max(1, inner_w - TEXT_RIGHT_GUARD)
+    channel = visual_crop(channel, text_w)
+    meta = visual_crop(meta, text_w)
+    title_w = text_w
+    title_rows = wrap_lines(title, title_w, 3)
+    
+    if selected:
+        title_rows = [paint(row, "bright_black") for row in title_rows]
+        channel = paint(channel, "bright_black")
+        meta = paint(meta, "bright_black")
+        
+    for row in title_rows:
+        lines.append(side + fit(row, inner_w) + side)
+    for _ in range(max(0, 3 - len(title_rows))):
+        lines.append(side + (" " * inner_w) + side)
+        
+    lines.append(side + fit(channel, inner_w) + side)
+    lines.append(side + fit(meta, inner_w) + side)
+    lines.append(border(width, color="bright_black" if selected else None))
     return lines
 
 
@@ -529,13 +742,15 @@ def merge_grid(cards: list[list[str]], columns: int, gap: int = 2) -> str:
         chunk = cards[start : start + columns]
         heights = [len(card) for card in chunk]
         max_h = max(heights)
-        widths = [max(len(line) for line in card) for card in chunk]
+        # Calculate visual widths of each column in the chunk
+        widths = [max(get_display_width(line) for line in card) for card in chunk]
         for y in range(max_h):
             parts = []
             for card, card_w in zip(chunk, widths):
-                parts.append((card[y] if y < len(card) else "").ljust(card_w))
+                line = card[y] if y < len(card) else ""
+                line_w = get_display_width(line)
+                parts.append(line + (" " * (card_w - line_w)))
             rows.append((" " * gap).join(parts))
-        rows.append("")
     return "\n".join(rows).rstrip()
 
 
@@ -550,26 +765,40 @@ def trim_to_height(lines: list[str], height: int, width: int) -> list[str]:
     return flattened[: height - 1] + [fit("...", width)]
 
 
-def render_home_interface(data: dict[str, Any] | None = None, width: int = 120, height: int = 40) -> str:
-    width = max(40, width)
-    height = max(12, height)
+def render_home_interface(data: dict[str, Any] | None = None, width: int = 120, height: int = 40, selected_id: str = "", scroll_row: int = 0) -> str:
+    width = max(60, width)
+    height = max(15, height)
     data = data or sample_home_data()
-    sidebar_w = 18 if width >= 96 else 0
+    sidebar_w = 20 if width >= 100 else 0
     content_w = width - sidebar_w - (2 if sidebar_w else 0)
 
-    header = nav_bar(width, "Home")
+    header = nav_bar(width, "Home", selected_id)
     content_lines: list[str] = []
 
-    columns = 3 if content_w >= 114 else 2 if content_w >= 82 else 1
-    card_w = max(30, (content_w - 2 - ((columns - 1) * 2)) // columns)
-    thumb_h = 10 if height >= 34 else 9 if height >= 24 else 8
-    card_h = thumb_h + 2
-    available_grid_h = max(card_h, height - len(header) - len(content_lines))
-    visible_rows = max(1, available_grid_h // (card_h + 1))
-    max_videos = max(1, columns * visible_rows)
+    # Force 3x3 grid
+    columns = 3
+    card_w = (content_w - ((columns - 1) * 2)) // columns
+    
+    # Dynamic sizing based on terminal height to fill the screen
+    header_h = len(header)
+    available_h = height - header_h - 1
+    
+    # We want to show exactly 3 rows if possible
+    visible_rows = 3
+    
+    card_h = available_h // visible_rows
+    thumb_h = card_h - 6 # 6 is the extra height for title/meta
+    thumb_h = max(4, min(40, thumb_h))
+    
+    # Recalculate based on clamped thumb_h
+    card_h = thumb_h + 6
+    max_videos = columns * visible_rows
+
+    start_idx = scroll_row * columns
+    end_idx = start_idx + max_videos
     cards = [
-        render_video_card(item, card_w, index + 1, thumb_h)
-        for index, item in enumerate(data.get("videos", [])[:max_videos])
+        render_video_card(item, card_w, index + start_idx, thumb_h, selected=(selected_id == f"video_{index + start_idx}"))
+        for index, item in enumerate(data.get("videos", [])[start_idx:end_idx])
     ]
     grid = merge_grid(cards, columns).splitlines()
     content_lines.extend(grid)
@@ -580,13 +809,14 @@ def render_home_interface(data: dict[str, Any] | None = None, width: int = 120, 
     sidebar = [
         border(sidebar_w),
         "|" + fit("  Home", sidebar_w - 2) + "|",
-        "|" + fit("  Shorts", sidebar_w - 2) + "|",
         "|" + fit("  Subscriptions", sidebar_w - 2) + "|",
         "|" + fit("  History", sidebar_w - 2) + "|",
         "|" + fit("  Playlists", sidebar_w - 2) + "|",
         "|" + fit("  Downloads", sidebar_w - 2) + "|",
         border(sidebar_w),
     ]
+    if len(sidebar) < len(content_lines):
+        sidebar.extend(box_line(sidebar_w) for _ in range(len(content_lines) - len(sidebar)))
     return "\n".join(trim_to_height(header + [merge_columns(sidebar, content_lines)], height, width))
 
 
@@ -627,7 +857,7 @@ def render_sidebar(suggestions: list[dict[str, str]], width: int) -> list[str]:
     lines.append("+" + "-" * (width - 2) + "+")
 
     inner_w = max(10, width - 2)
-    for item in suggestions[:6]:
+    for item in suggestions[:9]:
         title_lines = wrap_lines(item["title"], inner_w - 2, 2) or ["Untitled"]
         meta_line = clean_text(item["channel"])
         if item["meta"]:
@@ -643,14 +873,16 @@ def render_sidebar(suggestions: list[dict[str, str]], width: int) -> list[str]:
 
 
 def merge_columns(left: list[str], right: list[str], gap: int = 2) -> str:
-    left_w = max(len(line) for line in left) if left else 0
-    right_w = max(len(line) for line in right) if right else 0
+    left_w = max(get_display_width(line) for line in left) if left else 0
+    right_w = max(get_display_width(line) for line in right) if right else 0
     rows = max(len(left), len(right))
     merged = []
     for i in range(rows):
-        l = left[i] if i < len(left) else " " * left_w
-        r = right[i] if i < len(right) else " " * right_w
-        merged.append(l.ljust(left_w) + (" " * gap) + r)
+        l = left[i] if i < len(left) else ""
+        r = right[i] if i < len(right) else ""
+        l_w = get_display_width(l)
+        r_w = get_display_width(r)
+        merged.append(l + (" " * (left_w - l_w)) + (" " * gap) + r)
     return "\n".join(merged)
 
 
@@ -706,22 +938,30 @@ def render_ascii_interface(data: dict[str, Any], width: int = 120, height: int =
         top = merge_columns(player, suggestions)
 
     metadata = " | ".join(part for part in [data.get("views", ""), data.get("length", "")] if part) or "Metadata unavailable"
-    info_lines = [""]
-    info_lines.extend(wrap_lines(data.get("title", "Untitled"), width, 3) or ["Untitled"])
-    info_lines.extend(wrap_lines(f"Channel: {data.get('channel', 'YouTube')}", width, 2))
-    info_lines.extend(wrap_lines(metadata, width, 2))
-    info_lines.extend(wrap_lines("[ Like ] [ Share ] [ Save ] [ Subscribe ]", width, 2))
-    info_lines.append("")
-    info_lines.extend(wrap_lines(data.get("description", ""), width - 2, 5))
+    info_lines = []
+    
+    title_rows = wrap_lines(data.get("title", "Untitled"), width - 4, 3)
+    for row in title_rows:
+        info_lines.append("| " + fit(row, width - 4) + " |")
+        
+    info_lines.append("| " + fit(f"Channel: {data.get('channel', 'YouTube')}", width - 4) + " |")
+    info_lines.append("| " + fit(metadata, width - 4) + " |")
+    info_lines.append("| " + fit("[ Like ] [ Share ] [ Save ] [ Subscribe ]", width - 4) + " |")
+    info_lines.append("|" + (" " * (width - 2)) + "|")
+    
+    desc_rows = wrap_lines(data.get("description", ""), width - 4, 5)
+    for row in desc_rows:
+        info_lines.append("| " + fit(row, width - 4) + " |")
+        
     info_lines.extend(
         [
-            "",
-            "+" + "-" * (width - 2) + "+",
-            "|" + fit(" Comments", width - 2) + "|",
-            "+" + "-" * (width - 2) + "+",
+            "|" + (" " * (width - 2)) + "|",
+            "|" + border(width - 2) + "|",
+            "| " + fit(" Comments", width - 4) + " |",
+            "|" + border(width - 2) + "|",
             "| " + fit("@viewer  This looks like YouTube escaped into the terminal.", width - 4) + " |",
             "| " + fit("@ascii_fan  The recommendation rail is the best part.", width - 4) + " |",
-            "+" + "-" * (width - 2) + "+",
+            "|" + border(width - 2) + "|",
         ]
     )
 
@@ -745,6 +985,202 @@ def render_ascii_interface(data: dict[str, Any], width: int = 120, height: int =
     return "\n".join(trim_to_height(page_header + [top] + info_lines, height, width))
 
 
+def run_interactive(data: dict[str, Any], width: int, height: int, color_mode: str, api_base: str = None, query: str = None):
+    # Clear screen and move cursor to home
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+    
+    selected_id = "video_0"
+    scroll_row = 0
+    current_max_results = len(data.get("videos", []))
+    num_videos = current_max_results
+    need_redraw = True
+    is_fetching = False
+
+    # Pre-calculate layout parameters
+    def calc_layout(w, h):
+        sidebar_w = 20 if w >= 100 else 0
+        content_w = w - sidebar_w - (2 if sidebar_w else 0)
+        cols = 3
+        hdr_h = 4
+        avail_h = h - hdr_h - 1
+        vis_rows = 3
+        c_h = avail_h // vis_rows
+        t_h = max(4, min(40, c_h - 6))
+        actual_vis_rows = min(3, max(1, avail_h // (t_h + 6)))
+        return sidebar_w, content_w, cols, hdr_h, avail_h, t_h, actual_vis_rows
+
+    sidebar_w, content_w, columns, header_h, available_h, thumb_h, visible_rows = calc_layout(width, height)
+    
+    def fetch_more_bg():
+        nonlocal is_fetching, current_max_results, num_videos, need_redraw
+        try:
+            new_max = current_max_results + 18
+            new_data = fetch_api_search(api_base, query, min(100, new_max))
+            if len(new_data.get("videos", [])) > current_max_results:
+                data["videos"] = new_data["videos"]
+                current_max_results = len(data["videos"])
+                num_videos = current_max_results
+                need_redraw = True
+        except:
+            pass
+        finally:
+            is_fetching = False
+
+    while True:
+        if need_redraw:
+            # Move cursor to top
+            sys.stdout.write("\033[H")
+            
+            # Use pre-calculated values
+            ascii_ui = render_home_interface(data, width, height - 1, selected_id=selected_id, scroll_row=scroll_row)
+            if should_use_color(color_mode, None):
+                ascii_ui = colorize_ascii(ascii_ui)
+            
+            # Single atomic write to stdout
+            sys.stdout.write("\n" + ascii_ui)
+            sys.stdout.flush()
+            need_redraw = False
+            need_redraw = False
+        
+        # Wait for key
+        if not msvcrt.kbhit():
+            time.sleep(0.005)
+            continue
+            
+        key = msvcrt.getch()
+        need_redraw = True
+        
+        if key == b'\x1b' or key.lower() == b'q': # Esc or Q
+            break
+            
+        # Handle arrows (Windows)
+        if key in (b'\x00', b'\xe0'):
+            key = msvcrt.getch()
+            # Navigation logic
+            sidebar_w = 20 if width >= 100 else 0
+            columns = 3
+            
+            header_h = 4
+            available_h = height - header_h - 1
+            visible_rows = 3
+            card_h = available_h // visible_rows
+            thumb_h = max(4, min(40, card_h - 6))
+            visible_rows = max(1, available_h // (thumb_h + 6))
+            visible_rows = min(3, visible_rows)
+            
+            if selected_id.startswith("video_"):
+                idx = int(selected_id.split("_")[1])
+                num_videos = len(data.get("videos", []))
+                
+                if key == b'P': # Down
+                    if idx + columns < num_videos:
+                        new_idx = idx + columns
+                        selected_id = f"video_{new_idx}"
+                        if (new_idx // columns) >= scroll_row + visible_rows:
+                            scroll_row += 1
+                elif key == b'H': # Up
+                    if idx >= columns:
+                        new_idx = idx - columns
+                        selected_id = f"video_{new_idx}"
+                        if (new_idx // columns) < scroll_row:
+                            scroll_row = max(0, scroll_row - 1)
+                    else:
+                        selected_id = "tab_0"
+                elif key == b'K': # Left
+                    if idx > 0:
+                        new_idx = idx - 1
+                        selected_id = f"video_{new_idx}"
+                        if (new_idx // columns) < scroll_row:
+                            scroll_row = max(0, (new_idx // columns))
+                elif key == b'M': # Right
+                    if idx < num_videos - 1:
+                        new_idx = idx + 1
+                        selected_id = f"video_{new_idx}"
+                        if (new_idx // columns) >= scroll_row + visible_rows:
+                            scroll_row = (new_idx // columns) - visible_rows + 1
+
+                # Proactive Load More in Background
+                # 영상이 갑자기 추가되는 버그 수정을 위해 트리거 조건을 더 엄격하게 제한
+                if query and api_base and current_max_results < 100 and not is_fetching:
+                    # 마지막 줄에 도달했고, 아래(Down) 혹은 오른쪽(Right)으로 이동 중일 때만 트리거
+                    if (key in (b'P', b'M')) and (idx >= num_videos - 3):
+                        is_fetching = True
+                        threading.Thread(target=fetch_more_bg, daemon=True).start()
+                        
+            elif selected_id.startswith("tab_"):
+                idx = int(selected_id.split("_")[1])
+                if key == b'K': # Left
+                    if idx > 0: selected_id = f"tab_{idx - 1}"
+                elif key == b'M': # Right
+                    if idx < 2: selected_id = f"tab_{idx + 1}" # Max 2 now (Home, Subs, Library)
+                elif key == b'P': # Down
+                    selected_id = "video_0"
+                elif key == b'H': # Up
+                    selected_id = "search"
+                    
+            elif selected_id == "search":
+                if key == b'P': # Down
+                    selected_id = "tab_0"
+        
+        elif key == b'\r': # Enter
+            if selected_id.startswith("video_"):
+                idx = int(selected_id.split("_")[1])
+                videos = data.get("videos", [])
+                if 0 <= idx < len(videos):
+                    video = videos[idx]
+                    url = video.get("url")
+                    if url:
+                        if url.startswith("/"):
+                            url = "https://www.youtube.com" + url
+                        
+                        # Get path to video_ascii.py
+                        script_dir = os.path.dirname(os.path.abspath(__file__))
+                        player_script = os.path.join(script_dir, "video_ascii.py")
+                        
+                        # Build command
+                        cmd = [sys.executable, player_script, "--url", url]
+                        if should_use_color(color_mode, None):
+                            cmd.append("--color")
+                        
+                        # Fetch suggestions in background or before playing
+                        suggestions = []
+                        if api_base:
+                            sys.stdout.write("\n[i] 추천 영상 정보 가져오는 중...")
+                            sys.stdout.flush()
+                            try:
+                                v_data = fetch_api_video(api_base, url)
+                                suggestions = v_data.get("suggestions", [])
+                            except:
+                                pass
+                        
+                        # Fallback: API에서 추천 영상을 못 가져오면 현재 리스트에서 다른 영상들을 추천으로 표시
+                        if not suggestions and data.get("videos"):
+                            all_vids = data["videos"]
+                            # 현재 재생 중인 영상을 제외한 다른 영상들 8개 추출
+                            suggestions = [v for i, v in enumerate(all_vids) if i != idx][:8]
+                        
+                        if suggestions:
+                            cmd.extend(["--suggestions", json.dumps(suggestions)])
+                        
+                        # Clear screen and show cursor before running player
+                        sys.stdout.write("\033[?25h\033[2J\033[H")
+                        sys.stdout.flush()
+                        
+                        try:
+                            # Run the video player
+                            subprocess.run(cmd)
+                        except KeyboardInterrupt:
+                            pass
+                        except Exception as e:
+                            print(f"\n[error] Failed to start video player: {e}")
+                            time.sleep(2)
+                        
+                        # Restore UI state: hide cursor and clear screen
+                        sys.stdout.write("\033[?25l\033[2J\033[H")
+                        sys.stdout.flush()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Render a YouTube-like interface as ASCII art.",
@@ -753,7 +1189,7 @@ def main():
     parser.add_argument("--page", choices=["home", "watch"], default="home", help="Mock page to render without URL")
     parser.add_argument("--search", "-s", help="Search query to render with /api/youtube/search")
     parser.add_argument("--api-base", default="http://127.0.0.1:3000", help="YouTube API server base URL")
-    parser.add_argument("--max-results", type=int, default=12, help="Maximum search results to request from the API")
+    parser.add_argument("--max-results", type=int, default=9, help="Maximum search results to request from the API")
     parser.add_argument("--width", type=int, help="ASCII output width. Default: current terminal width")
     parser.add_argument("--height", type=int, help="ASCII output height. Default: current terminal height")
     parser.add_argument(
@@ -763,36 +1199,49 @@ def main():
         help="ANSI color mode. Default: auto",
     )
     parser.add_argument("--output", "-o", help="Optional output file (.txt)")
+    parser.add_argument("--select", help="ID of the component to select (search, video_0, etc.)")
+    parser.add_argument("--interactive", "-i", action="store_true", help="Run in interactive mode")
     args = parser.parse_args()
 
+    if sys.platform == "win32":
+        try:
+            sys.stdout.reconfigure(encoding='utf-8')
+        except (AttributeError, io.UnsupportedOperation):
+            pass
+
     width, height = resolve_output_size(args.width, args.height)
+    
     if args.search:
         data = fetch_api_search(args.api_base, args.search, args.max_results)
-        ascii_ui = render_home_interface(data, width, height)
     elif args.url:
         data = fetch_api_video(args.api_base, args.url)
-        ascii_ui = render_ascii_interface(data, width, height)
     elif args.page == "watch":
-        ascii_ui = render_ascii_interface(sample_watch_data(), width, height)
+        data = sample_watch_data()
     else:
-        ascii_ui = render_home_interface(sample_home_data(), width, height)
+        data = sample_home_data()
 
-    if should_use_color(args.color, args.output):
-        ascii_ui = colorize_ascii(ascii_ui)
-
-    if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(ascii_ui)
-        print(f"[ok] saved ASCII interface to {args.output}")
+    if args.interactive or (not args.output and sys.stdin.isatty()):
+        sys.stdout.write("\033[?25l")
+        try:
+            run_interactive(data, width, height, args.color, api_base=args.api_base, query=args.search)
+        finally:
+            # Show cursor and clear screen on exit
+            sys.stdout.write("\033[?25h\033[2J\033[H")
+            sys.stdout.flush()
     else:
-        print(ascii_ui)
-
+        ascii_ui = render_home_interface(data, width, height, selected_id=args.select or "")
+        if should_use_color(args.color, args.output):
+            ascii_ui = colorize_ascii(ascii_ui)
+        if args.output:
+            with open(args.output, "w", encoding="utf-8") as f:
+                f.write(ascii_ui)
+        else:
+            print(ascii_ui)
 
 if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        print("\n[info] interrupted", file=sys.stderr)
         sys.exit(130)
     except Exception as exc:
         print(f"[error] {exc}", file=sys.stderr)

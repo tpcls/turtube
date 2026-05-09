@@ -12,3 +12,11 @@ __pycache__/
 *.py[cod]
 
 build/
+
+# Windows 빌드 아티팩트
+*.obj
+*.pdb
+*.exp
+*.lib
+*.ilk
+Thumbs.db

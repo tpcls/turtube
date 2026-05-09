@@ -33,11 +33,15 @@ import queue
 import ctypes
 import importlib.util
 import platform
+import urllib.request
+import re as _re
+import numpy as np
+import cv2
 from pathlib import Path
 
 
 class CppAsciiEngine:
-    """ctypes wrapper around libascii_engine.so."""
+    """ctypes wrapper around libascii_engine.so / ascii_engine.dll."""
 
     def __init__(self, lib_path: str | None = None):
         self.has_cpp = False
@@ -46,8 +50,12 @@ class CppAsciiEngine:
         if lib_path is None:
             src_dir = os.path.dirname(__file__)
             project_dir = os.path.dirname(src_dir)
+            # Windows(.dll) 및 Linux/macOS(.so) 모두 탐색
             candidates = [
-                os.path.join(project_dir, "build", "libascii_engine.so"),
+                os.path.join(project_dir, "build", "ascii_engine.dll"),      # Windows MSVC/MinGW
+                os.path.join(project_dir, "build", "libascii_engine.so"),    # Linux
+                os.path.join(project_dir, "build", "libascii_engine.dylib"), # macOS
+                os.path.join(src_dir, "ascii_engine.dll"),
                 os.path.join(src_dir, "libascii_engine.so"),
             ]
             lib_path = next((path for path in candidates if os.path.exists(path)), candidates[0])
@@ -153,13 +161,16 @@ try:
 except Exception as e:
     pass
 
-# 2. CUDA (NVIDIA GPU)
+# 2. CUDA (NVIDIA GPU) — Windows/Linux 공통 지원
 if BACKEND == "cpu":
     try:
         import torch
         if torch.cuda.is_available():
             BACKEND = "cuda"
             print(f"[✓] CUDA 백엔드 감지: {torch.cuda.get_device_name(0)}")
+        elif torch.cuda.device_count() == 0 and platform.system() == "Windows":
+            # Windows에서 torch는 설치됐지만 CUDA 드라이버 없는 경우
+            pass
     except ImportError:
         pass
 
@@ -948,9 +959,54 @@ class AsciiVideoPipeline:
                 except queue.Full:
                     self._render_blocked += 1
 
+    def _visual_len(self, s):
+        """ANSI 코드를 제외한 문자열의 실제 출력 너비 계산 (한글 2칸 고려)"""
+        clean = _re.sub(r'\x1b\[[0-9;]*m', '', s)
+        length = 0
+        for char in clean:
+            if ord(char) > 0x7F: # 대략적인 한글/특수문자 판별
+                length += 2
+            else:
+                length += 1
+        return length
+
+    def _visual_ljust(self, s, width):
+        """실제 출력 너비 기준 ljust 구현"""
+        vlen = self._visual_len(s)
+        return s + " " * max(0, width - vlen)
+
+    def _set_cursor_visible(self, visible):
+        """커서 가시성 제어 (ANSI + Windows API)"""
+        if visible:
+            sys.stdout.write("\x1b[?25h")
+            if platform.system() == "Windows":
+                import ctypes
+                class CursorInfo(ctypes.Structure):
+                    _fields_ = [("size", ctypes.c_int), ("visible", ctypes.c_byte)]
+                handle = ctypes.windll.kernel32.GetStdHandle(-11)
+                cursor = CursorInfo()
+                ctypes.windll.kernel32.GetConsoleCursorInfo(handle, ctypes.byref(cursor))
+                cursor.visible = True
+                ctypes.windll.kernel32.SetConsoleCursorInfo(handle, ctypes.byref(cursor))
+        else:
+            sys.stdout.write("\x1b[?25l")
+            if platform.system() == "Windows":
+                import ctypes
+                class CursorInfo(ctypes.Structure):
+                    _fields_ = [("size", ctypes.c_int), ("visible", ctypes.c_byte)]
+                handle = ctypes.windll.kernel32.GetStdHandle(-11)
+                cursor = CursorInfo()
+                ctypes.windll.kernel32.GetConsoleCursorInfo(handle, ctypes.byref(cursor))
+                cursor.visible = False
+                ctypes.windll.kernel32.SetConsoleCursorInfo(handle, ctypes.byref(cursor))
+        sys.stdout.flush()
+
     def run_terminal(self, source, fps_target: float = 30.0,
-                     hide_cursor: bool = True, loop: bool = False):
+                     hide_cursor: bool = True, loop: bool = False, suggestions: list = None):
         """실시간 터미널 출력 (터미널 리사이즈 자동 대응)"""
+        if hide_cursor:
+            self._set_cursor_visible(False)
+            
         webcam = isinstance(source, int)
         frame_delay = 1.0 / fps_target
 
@@ -1025,26 +1081,67 @@ class AsciiVideoPipeline:
                         sys.stdout.write("\x1b[2J\x1b[H")
                         prev_out_lines = 0
 
-                    # ── 출력 최적화: 모든 escape sequence를 하나의 문자열로 통합 ──────────────
-                    # 커서 이동 코드 생성
-                    move_cursor = f"\x1b[{prev_out_lines + 1}A\x1b[0G" if prev_out_lines > 0 else "\x1b[H"
+                    # ── 출력 최적화 ──────────────────────────────────────────────
+                    # 절대적 홈 이동(\x1b[H) 사용으로 화면 흔들림 원천 봉쇄
+                    move_cursor = "\x1b[H"
                     
                     # 상태바 (LED 효과)
                     frame_count += 1
                     cols, rows = cur_term_size
                     drop_indicator = f" (버퍼대기:{drops_local})" if drops_local > 0 else ""
+                    s_count = len(suggestions) if suggestions else 0
                     status = (
                         f" FPS:{fps_display:5.1f} | "
                         f"프레임:{frame_count}" + (f"/{total}" if total > 0 else "") +
                         f" | {cols}×{rows}터미널 → {frame_w}×{frame_h}출력"
-                        f" | {BACKEND.upper()}{drop_indicator} "
+                        f" | {BACKEND.upper()}{drop_indicator} | 추천:{s_count}"
                     )
                     status = status[:cols - 1].ljust(cols - 1)
                     
-                    # 한 번에 모든 출력 (I/O 시스템 콜 최소화)
-                    output = f"{move_cursor}{ascii_str}\n\x1b[38;2;0;255;0m{status}\x1b[0m\n"
+                    # 터미널 높이를 초과하지 않도록 출력 줄 수 제한 (더 보수적으로 제한)
+                    max_allowed_rows = max(10, rows - 3)
+                    
+                    if (suggestions is not None) and cols >= 100:
+                        # 사이드바 너비를 남는 공간에 맞춰 정밀하게 계산 (최대 65)
+                        sidebar_w = min(65, cols - frame_w - 4)
+                        if sidebar_w < 20: 
+                            sidebar_w = 0
+                        
+                        thumb_count = len(getattr(self, '_thumb_ascii_cache', {}))
+                        needs_refresh = (not hasattr(self, '_sidebar_cache') or 
+                                         self._sidebar_cache_w != sidebar_w or 
+                                         getattr(self, '_last_thumb_count', -1) != thumb_count)
+                        
+                        if needs_refresh:
+                            self._sidebar_cache = self._render_sidebar_lines(suggestions, sidebar_w)
+                            self._sidebar_cache_w = sidebar_w
+                            self._last_thumb_count = thumb_count
+                        
+                        v_lines = ascii_str.splitlines()
+                        s_lines = self._sidebar_cache
+                        
+                        merged = []
+                        max_l = min(max_allowed_rows, max(len(v_lines), len(s_lines)))
+                        merged = []
+                        max_l = min(max_allowed_rows, max(len(v_lines), len(s_lines)))
+                        for i in range(max_l):
+                            vl = v_lines[i] if i < len(v_lines) else ""
+                            sl = s_lines[i] if i < len(s_lines) else ""
+                            # \x1b[{n}G: 커서를 n번째 열로 이동 (하드웨어 가속 정렬)
+                            # 영상(vl) 출력 후 사이드바(sl)를 정확한 위치에 배치
+                            merged.append(f"{vl}\x1b[{frame_w + 3}G{sl}\x1b[K")
+                        ascii_str = "\n".join(merged)
+                        out_lines = max_l
+                    else:
+                        v_lines = ascii_str.splitlines()
+                        ascii_str = "\n".join([line + "\x1b[K" for line in v_lines[:max_allowed_rows]])
+                        out_lines = len(v_lines[:max_allowed_rows])
+
+                    # 한 번에 모든 출력 (홈 이동 + 상태바)
+                    # \x1b[0m으로 모든 색상 초기화 후 출력
+                    output = f"\x1b[H\x1b[0m{ascii_str}\n\x1b[38;2;0;255;0m{status}\x1b[0m\x1b[K"
                     sys.stdout.write(output)
-                    prev_out_lines = out_lines
+                    prev_out_lines = out_lines + 1
 
                     now = time.perf_counter()
                     fps_display = frame_count / (now - t0)
@@ -1060,13 +1157,162 @@ class AsciiVideoPipeline:
                 print("\n[i] 중단됨")
             finally:
                 self._stop.set()
-                if hide_cursor:
-                    sys.stdout.write("\x1b[?25h")
                 cap.release()
                 t.join(timeout=2)
-
+                if hide_cursor:
+                    self._set_cursor_visible(True) # 커서 복구
+                
             if not loop or webcam:
                 break
+
+    def _render_sidebar_lines(self, suggestions, width):
+        """추천 영상 목록을 ASCII 줄 리스트로 변환 (작은 컬러 섬네일 포함)"""
+        lines = []
+        if not suggestions or width < 30: return lines
+        
+        # 섬네일 캐시 및 로딩 상태 초기화
+        if not hasattr(self, '_thumb_ascii_cache'):
+            self._thumb_ascii_cache = {}
+            self._thumb_loading_started = set()
+
+        # 아직 로딩을 시작하지 않은 영상이 있다면 스레드 시작
+        has_new = any(s.get("id") and s.get("id") not in self._thumb_loading_started for s in suggestions[:8])
+        if has_new:
+            threading.Thread(target=self._preload_thumbnails, args=(suggestions,), daemon=True).start()
+
+        # 너비 보정을 위해 텍스트 길이 정밀 계산
+        title_text = "추천 영상"
+        border = "\x1b[97m+" + "-" * (width - 2) + "+\x1b[0m"
+        lines.append(border)
+        lines.append("\x1b[97;1m| " + self._visual_ljust(title_text, width - 4) + " |\x1b[0m")
+        lines.append(border)
+        
+        # 섬네일 크기 설정
+        thumb_w = 12
+        thumb_h = 5
+        
+        for idx, s in enumerate(suggestions[:6]):
+            vid_id = s.get("id")
+            title = s.get("title", "Untitled")
+            channel = s.get("channelTitle", "YouTube")
+            
+            # 섬네일 ASCII 가져오기 (없으면 로딩 표시)
+            if vid_id in getattr(self, '_thumb_ascii_cache', {}):
+                t_ascii = self._thumb_ascii_cache[vid_id]
+            else:
+                # 로딩 애니메이션 효과 (프레임마다 점이 움직임)
+                dots = "." * (1 + (int(time.time() * 2) % 3))
+                t_ascii = [f" \x1b[90m[ 로딩중{dots.ljust(3)} ]\x1b[0m "] * thumb_h
+            
+            # 제목 줄바꿈 (3줄까지 허용하여 짤림 방지)
+            t_clean = _re.sub(r'\x1b\[[0-9;]*m', '', title)
+            t_rows = []
+            curr = ""
+            curr_vlen = 0
+            for char in t_clean:
+                char_vlen = 2 if ord(char) > 0x7F else 1
+                if curr_vlen + char_vlen < width - thumb_w - 8:
+                    curr += char
+                    curr_vlen += char_vlen
+                else:
+                    t_rows.append(curr)
+                    curr = char
+                    curr_vlen = char_vlen
+            if curr: t_rows.append(curr)
+            
+            # 1~3행: 섬네일 + 제목 (3줄로 확장)
+            for i in range(3):
+                row_text = t_rows[i] if i < len(t_rows) else ""
+                content = self._visual_ljust(row_text, width - thumb_w - 6)
+                lines.append(f"\x1b[97m| {t_ascii[i]}  {content} |\x1b[0m")
+            
+            # 4행: 섬네일 + 채널명 & 영상 길이
+            c_clean = _re.sub(r'\x1b\[[0-9;]*m', '', channel)
+            duration = s.get("duration", "")
+            
+            # 채널명과 길이를 조합 (길이는 노란색 강조)
+            if duration:
+                # 채널명이 너무 길면 잘라냄
+                avail_w = width - thumb_w - 15
+                info_text = f"{c_clean[:avail_w]} \x1b[93m[{duration}]\x1b[0m"
+            else:
+                info_text = c_clean
+                
+            c_content = self._visual_ljust(info_text, width - thumb_w - 6)
+            lines.append(f"\x1b[97m| {t_ascii[3]}  \x1b[36m{c_content}\x1b[0m |\x1b[0m")
+            
+            # 5행: 섬네일 나머지
+            lines.append(f"\x1b[97m| {t_ascii[4]}  {' ' * (width - thumb_w - 6)} |\x1b[0m")
+                
+            lines.append("\x1b[97m|" + " " * (width - 2) + "|\x1b[0m")
+            
+        lines.append(border)
+        return lines
+
+    def _preload_thumbnails(self, suggestions):
+        """백그라운드에서 추천 영상들의 섬네일을 ASCII로 변환하여 캐싱 (더 강력한 다운로드 로직)"""
+        import ssl
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        thumb_w = 12
+        thumb_h = 5
+        
+        if not hasattr(self, '_thumb_loading_started'):
+            self._thumb_loading_started = set()
+
+        for s in suggestions[:8]:
+            vid_id = s.get("id")
+            if not vid_id or vid_id in getattr(self, '_thumb_ascii_cache', {}) or vid_id in self._thumb_loading_started:
+                # 이미 캐시에 있거나 현재 로딩 중이면 건너뛰되, 캐시에 진짜 있는지는 다시 확인
+                if vid_id in getattr(self, '_thumb_ascii_cache', {}):
+                    continue
+                # 로딩 중인데 너무 오래 걸리면(예: 30초) 다시 시도할 수 있게 할 수도 있음
+                if vid_id in self._thumb_loading_started and vid_id not in self._thumb_ascii_cache:
+                    # 일단은 계속 진행
+                    pass
+                else:
+                    continue
+            
+            self._thumb_loading_started.add(vid_id)
+            
+            # 여러 품질의 썸네일 URL 후보군 생성
+            urls = []
+            thumbs = s.get("thumbnails", [])
+            if thumbs:
+                urls.extend([t.get("url") for t in thumbs if t.get("url")])
+            urls.append(f"https://i.ytimg.com/vi/{vid_id}/hqdefault.jpg")
+            urls.append(f"https://i.ytimg.com/vi/{vid_id}/default.jpg")
+            
+            for url in urls:
+                if not url: continue
+                try:
+                    req = urllib.request.Request(url, headers={
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+                    })
+                    with urllib.request.urlopen(req, timeout=5, context=ctx) as resp:
+                        if resp.status != 200: continue
+                        img_array = np.asarray(bytearray(resp.read()), dtype=np.uint8)
+                        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+                        if img is None: continue
+                        
+                        small = cv2.resize(img, (thumb_w, thumb_h), interpolation=cv2.INTER_AREA)
+                        ascii_rows = []
+                        for y in range(thumb_h):
+                            row_ansi = ""
+                            for x in range(thumb_w):
+                                b, g, r = small[y, x]
+                                gray = int(0.299 * r + 0.587 * g + 0.114 * b)
+                                char = " .:-=+*#%@"[min(9, gray // 26)]
+                                row_ansi += f"\x1b[38;2;{r};{g};{b}m{char}"
+                            ascii_rows.append(row_ansi + "\x1b[0m")
+                        
+                        self._thumb_ascii_cache[vid_id] = ascii_rows
+                        break # 성공하면 다음 영상으로
+                except:
+                    continue
+            time.sleep(0.1) # 서버 부하 방지 및 안정성
 
     def run_export_html(self, source, output_path: str):
         """HTML 파일로 내보내기 (병렬 처리 최적화)"""
@@ -1355,6 +1601,7 @@ def main():
                         help="터미널 출력 전 ASCII로 선변환해 둘 버퍼 길이(초). 파일 재생 권장 1~5초 (기본: 1.5)")
     parser.add_argument("--backend", choices=["auto", "cuda", "mlx", "cupy", "cpu"],
                         default="auto", help="강제 백엔드 선택")
+    parser.add_argument("--suggestions", help="JSON string of suggested videos")
 
     args = parser.parse_args()
 
@@ -1420,7 +1667,24 @@ def main():
     )
     if auto_size:
         cols, rows = get_terminal_size()
-        print(f"[✓] 자동 해상도 모드: 터미널 {cols}×{rows} 에 맞춤")
+        
+        # 추천 영상이 있을 경우 사이드바 공간(약 60~70칸)을 미리 확보
+        if args.suggestions:
+            try:
+                import json
+                s_list = json.loads(args.suggestions)
+                if s_list and cols > 120:
+                    conv.width = cols - 70
+                elif s_list and cols > 90:
+                    conv.width = cols - 50
+                else:
+                    conv.width = cols
+            except:
+                conv.width = cols
+        else:
+            conv.width = cols
+
+        print(f"[✓] 자동 해상도 모드: 터미널 {cols}×{rows} 에 맞춤 (영상 너비: {conv.width})")
     
     # 화질 정보 출력
     if args.url:
@@ -1467,8 +1731,17 @@ def main():
                 f"\n[설정] 너비:{args.width} | 팔레트:{args.palette} | 색상:{args.color} | "
                 f"백엔드:{BACKEND.upper()} | 선버퍼:{args.buffer_seconds:.1f}s"
             )
+            
+            suggestions = []
+            if args.suggestions:
+                try:
+                    import json
+                    suggestions = json.loads(args.suggestions)
+                except:
+                    pass
+            
             print("Ctrl+C 로 종료\n")
-            pipeline.run_terminal(source, fps_target, loop=args.loop)
+            pipeline.run_terminal(source, fps_target, loop=args.loop, suggestions=suggestions)
     finally:
         # URL 다운로드 임시 파일 정리
         if needs_cleanup and yt_source:
