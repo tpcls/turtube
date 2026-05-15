@@ -12,6 +12,9 @@ OUT_FILE="$PROJECT_DIR/build/libascii_engine.so"
 
 echo "[▶] C++ ASCII Engine 빌드 중..."
 
+# 출력 디렉토리 생성
+mkdir -p "$PROJECT_DIR/build"
+
 # 입력 파일 존재 확인
 if [[ ! -f "$CPP_FILE" ]]; then
     echo "[✗] 소스 파일 없음: $CPP_FILE"

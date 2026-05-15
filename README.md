@@ -239,6 +239,23 @@ API 서버 주소를 바꾼 경우:
 ./run_youtube_ascii.sh --api-base "http://127.0.0.1:4000" --search "nodejs"
 ```
 
+브라우저에 로그인된 YouTube 쿠키로 추천 피드를 가져오려면:
+
+```bash
+./run_youtube_ascii --login chrome
+./run_youtube_ascii --login safari
+./run_youtube_ascii --cookies-from-browser "firefox:default"
+```
+
+인자 없이 실행한 뒤 상단 `[login]` 버튼에서 Enter를 누르면 기본 브라우저로 YouTube가 열립니다.
+브라우저에서 로그인한 뒤 터미널에서 Enter를 누르면 쿠키를 읽고 `[user]` 상태로 바뀝니다.
+
+Netscape 형식 `cookies.txt` 파일을 직접 지정할 수도 있습니다.
+
+```bash
+./run_youtube_ascii --cookies cookies.txt
+```
+
 ## C++ 엔진만 다시 빌드
 
 ### macOS / Linux

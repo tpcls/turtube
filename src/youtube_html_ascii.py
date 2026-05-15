@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import http.cookiejar
 import html
 import io
 import json
@@ -17,10 +18,78 @@ import threading
 import unicodedata
 import urllib.parse
 import urllib.request
+import webbrowser
+from pathlib import Path
 from typing import Any
 
 if sys.platform == "win32":
     import msvcrt
+else:
+    import termios
+    import tty
+    import select
+
+def get_input():
+    """크로스 플랫폼 키 입력 감지 (non-blocking)"""
+    if sys.platform == "win32":
+        if not msvcrt.kbhit():
+            return None
+        ch = msvcrt.getch()
+        # Windows handles arrows as prefix + key
+        if ch in (b'\x00', b'\xe0'):
+            ch2 = msvcrt.getch()
+            if ch2 == b'H': return b'up'
+            if ch2 == b'P': return b'down'
+            if ch2 == b'K': return b'left'
+            if ch2 == b'M': return b'right'
+            if ch2 == b'I': return b'pageup'
+            if ch2 == b'Q': return b'pagedown'
+            if ch2 == b'G': return b'home'
+            if ch2 == b'O': return b'end'
+        # Windows Enter is \r
+        if ch == b'\r': return b'enter'
+        return ch
+    else:
+        # Unix/macOS handles arrows as escape sequences
+        if not select.select([sys.stdin], [], [], 0)[0]:
+            return None
+        
+        try:
+            # sys.stdin.read(1) can buffer, so use os.read
+            ch = os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
+        except Exception:
+            return None
+
+        if ch == '\x1b':
+            # Check if it's an escape sequence (arrow) or just Esc key
+            if select.select([sys.stdin], [], [], 0.05)[0]:
+                ch2 = os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
+                if ch2 == '[':
+                    if select.select([sys.stdin], [], [], 0.05)[0]:
+                        ch3 = os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
+                        if ch3 == 'A': return b'up'
+                        if ch3 == 'B': return b'down'
+                        if ch3 == 'C': return b'right'
+                        if ch3 == 'D': return b'left'
+                        if ch3 == 'H': return b'home'
+                        if ch3 == 'F': return b'end'
+                        if ch3.isdigit():
+                            seq = ch3
+                            while select.select([sys.stdin], [], [], 0.01)[0]:
+                                seq += os.read(sys.stdin.fileno(), 1).decode('utf-8', errors='ignore')
+                                if seq.endswith("~"):
+                                    break
+                            if seq == "5~": return b'pageup'
+                            if seq == "6~": return b'pagedown'
+                            if seq == "1~": return b'home'
+                            if seq == "4~": return b'end'
+            return b'esc'
+        
+        # Unix Enter can be \n (LF) or \r (CR)
+        if ch == '\n' or ch == '\r':
+            return b'enter'
+            
+        return ch.encode('utf-8')
 
 try:
     from PIL import Image
@@ -51,6 +120,7 @@ COLORS = {
     "bright_white": "\033[97m",
 }
 _THUMBNAIL_ASCII_CACHE: dict[tuple[str, int, int, str], list[str]] = {}
+REQUEST_COOKIE_JAR: http.cookiejar.CookieJar | None = None
 
 
 def paint(text: str, color: str) -> str:
@@ -63,7 +133,7 @@ def colorize_ascii(ascii_ui: str) -> str:
     UI_TOKENS = re.compile(
         r"(\[>\] YouTube|\[YOUTUBE\]|YouTube)|"
         r"(\[play\]|\[ PLAY \])|"
-        r"(\[user\])|"
+        r"(\[user\]|\[login\])|"
         r"(\[\+\]|\[Upload\]|\[ Like \]|\[ Share \]|\[ Save \]|\[ Subscribe \])|"
         r"(\d[\d,.KM]* views?|\d+:\d+|LIVE|Live|Metadata unavailable)|"
         r"(@[\w_]+)"
@@ -102,6 +172,43 @@ def should_use_color(mode: str, output_path: str | None) -> bool:
     return output_path is None and sys.stdout.isatty()
 
 
+def configure_cookies(cookies_file: str | None = None, cookies_from_browser: str | None = None) -> None:
+    global REQUEST_COOKIE_JAR
+    if cookies_file:
+        jar = http.cookiejar.MozillaCookieJar()
+        jar.load(cookies_file, ignore_discard=True, ignore_expires=True)
+        REQUEST_COOKIE_JAR = jar
+        return
+
+    if cookies_from_browser:
+        try:
+            import yt_dlp.cookies
+        except ImportError as exc:
+            raise RuntimeError("yt-dlp is required for --login/--cookies-from-browser") from exc
+
+        browser, _, profile = cookies_from_browser.partition(":")
+        REQUEST_COOKIE_JAR = yt_dlp.cookies.extract_cookies_from_browser(
+            browser,
+            profile=profile or None,
+        )
+
+
+def add_request_cookies(req: urllib.request.Request) -> None:
+    if REQUEST_COOKIE_JAR is not None:
+        REQUEST_COOKIE_JAR.add_cookie_header(req)
+
+
+def configure_first_available_browser_cookies() -> str:
+    errors: list[str] = []
+    for browser in ("chrome", "safari", "firefox", "brave", "edge"):
+        try:
+            configure_cookies(None, browser)
+            return browser
+        except Exception as exc:
+            errors.append(f"{browser}: {exc}")
+    raise RuntimeError("; ".join(errors))
+
+
 def fetch_html(url: str, timeout: float = 15.0) -> str:
     req = urllib.request.Request(
         url,
@@ -110,6 +217,7 @@ def fetch_html(url: str, timeout: float = 15.0) -> str:
             "Accept-Language": "en-US,en;q=0.9",
         },
     )
+    add_request_cookies(req)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         charset = resp.headers.get_content_charset() or "utf-8"
         return resp.read().decode(charset, errors="replace")
@@ -123,6 +231,7 @@ def fetch_json(url: str, timeout: float = 20.0) -> dict[str, Any]:
             "Accept": "application/json",
         },
     )
+    add_request_cookies(req)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         charset = resp.headers.get_content_charset() or "utf-8"
         return json.loads(resp.read().decode(charset, errors="replace"))
@@ -136,6 +245,7 @@ def fetch_thumbnail_ascii(url: str, width: int, height: int) -> list[str]:
         return _THUMBNAIL_ASCII_CACHE[cache_key]
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        add_request_cookies(req)
         with urllib.request.urlopen(req, timeout=8.0) as resp:
             image = Image.open(io.BytesIO(resp.read())).convert("RGB")
         image = image.resize((width, height), Image.Resampling.LANCZOS)
@@ -222,7 +332,11 @@ def normalize_api_video(item: dict[str, Any]) -> dict[str, str]:
         "channel": clean_text(item.get("channelTitle", "")) or "YouTube",
         "meta": meta,
         "views": views,
-        "length": clean_text(item.get("lengthText", "")) or format_duration(item.get("durationSeconds")),
+        "length": (
+            clean_text(item.get("lengthText", ""))
+            or clean_text(item.get("duration", ""))
+            or format_duration(item.get("durationSeconds"))
+        ),
         "thumbnail": best_thumbnail(item.get("thumbnails")),
         "url": clean_text(item.get("links", {}).get("watch", "")) if isinstance(item.get("links"), dict) else "",
     }
@@ -236,6 +350,354 @@ def fetch_api_search(api_base: str, query: str, max_results: int) -> dict[str, A
     return {
         "chips": [],
         "videos": videos,
+    }
+
+
+def normalize_renderer_video(item: dict[str, Any]) -> dict[str, str]:
+    video_id = clean_text(item.get("videoId", ""))
+    view_text = first_text(item.get("viewCountText")) or first_text(item.get("shortViewCountText"))
+    published = first_text(item.get("publishedTimeText"))
+    length = first_text(item.get("lengthText"))
+    overlays = item.get("thumbnailOverlays")
+    if not length and isinstance(overlays, list) and overlays:
+        length = first_text(overlays[0].get("thumbnailOverlayTimeStatusRenderer", {}).get("text", {}))
+    meta = " | ".join(part for part in [view_text, published] if part)
+    return {
+        "title": first_text(item.get("title")) or first_text(item.get("headline")) or "Untitled",
+        "channel": (
+            first_text(item.get("ownerText"))
+            or first_text(item.get("shortBylineText"))
+            or first_text(item.get("longBylineText"))
+            or "YouTube"
+        ),
+        "meta": meta,
+        "views": view_text,
+        "length": length,
+        "thumbnail": best_thumbnail(item.get("thumbnail", {}).get("thumbnails")),
+        "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
+    }
+
+
+def first_content(value: Any) -> str:
+    if isinstance(value, str):
+        return clean_text(value)
+    if isinstance(value, dict):
+        direct = first_text(value)
+        if direct:
+            return direct
+        for key in ("content", "text", "title", "label"):
+            if key in value:
+                direct = first_content(value[key])
+                if direct:
+                    return direct
+    return ""
+
+
+def first_key_value(node: Any, wanted_key: str) -> Any:
+    if isinstance(node, dict):
+        if wanted_key in node:
+            return node[wanted_key]
+        for value in node.values():
+            found = first_key_value(value, wanted_key)
+            if found is not None:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = first_key_value(item, wanted_key)
+            if found is not None:
+                return found
+    return None
+
+
+def first_watch_video_id(node: Any) -> str:
+    endpoint = first_key_value(node, "watchEndpoint")
+    if isinstance(endpoint, dict):
+        video_id = clean_text(endpoint.get("videoId", ""))
+        if video_id:
+            return video_id
+    video_id = clean_text(first_key_value(node, "videoId") or "")
+    return video_id if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id) else ""
+
+
+def is_probable_watch_video_id(video_id: str) -> bool:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id or ""):
+        return False
+    # Playlist/channel IDs are sometimes embedded near recommendations and can
+    # look like 11-character video IDs when blindly scraped from page JSON.
+    return not video_id.startswith(("PL", "UU", "LL", "RD"))
+
+
+def best_thumbnail_from_any(node: Any) -> str:
+    thumbnails: list[dict[str, Any]] = []
+    for item in walk(node):
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("url"), str):
+            thumbnails.append(item)
+        for key in ("thumbnails", "sources"):
+            value = item.get(key)
+            if isinstance(value, list):
+                thumbnails.extend(thumb for thumb in value if isinstance(thumb, dict) and thumb.get("url"))
+    return best_thumbnail(thumbnails)
+
+
+def lockup_metadata_parts(item: dict[str, Any]) -> list[str]:
+    parts: list[str] = []
+    rows = first_key_value(item, "metadataRows")
+    if not isinstance(rows, list):
+        return parts
+    for row in rows:
+        row_parts = row.get("metadataParts", []) if isinstance(row, dict) else []
+        for part in row_parts:
+            text = first_content(part.get("text", {}) if isinstance(part, dict) else part)
+            if text and text not in parts:
+                parts.append(text)
+    return parts
+
+
+def normalize_lockup_video(item: dict[str, Any]) -> dict[str, str]:
+    video_id = clean_text(item.get("contentId", "")) or first_watch_video_id(item)
+    metadata = item.get("metadata", {})
+    lockup_metadata = metadata.get("lockupMetadataViewModel", {}) if isinstance(metadata, dict) else {}
+    title = (
+        first_content(lockup_metadata.get("title", {}))
+        or first_content(item.get("title", {}))
+        or (f"YouTube video {video_id}" if video_id else "Untitled")
+    )
+    parts = lockup_metadata_parts(item)
+    channel = parts[0] if parts else "YouTube"
+    meta = " | ".join(parts[1:4])
+    return {
+        "title": title,
+        "channel": channel,
+        "meta": meta,
+        "views": "",
+        "length": "",
+        "thumbnail": best_thumbnail_from_any(item),
+        "url": f"https://www.youtube.com/watch?v={video_id}" if video_id else "",
+    }
+
+
+def collect_html_video_ids(page_html: str, max_results: int) -> list[dict[str, str]]:
+    videos: list[dict[str, str]] = []
+    seen: set[str] = set()
+    watch_patterns = [
+        r'(?:/|\\/|\\u002F)watch(?:\?|\\u003F)v(?:=|\\u003D)([A-Za-z0-9_-]{11})',
+        r'"watchEndpoint"\s*:\s*\{[^{}]*"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"',
+    ]
+    matches = []
+    for pattern in watch_patterns:
+        matches.extend(re.finditer(pattern, page_html))
+
+    for match in sorted(matches, key=lambda item: item.start()):
+        video_id = match.group(1)
+        if video_id in seen or not is_probable_watch_video_id(video_id):
+            continue
+        seen.add(video_id)
+        start = max(0, match.start() - 3000)
+        end = min(len(page_html), match.end() + 3000)
+        context = page_html[start:end]
+        title = ""
+        for pattern in (
+            r'"title"\s*:\s*\{\s*"runs"\s*:\s*\[\s*\{\s*"text"\s*:\s*"([^"]+)"',
+            r'"title"\s*:\s*\{\s*"simpleText"\s*:\s*"([^"]+)"',
+            r'"content"\s*:\s*"([^"]+)"',
+        ):
+            title_match = re.search(pattern, context)
+            if title_match:
+                title = clean_text(title_match.group(1).encode("utf-8").decode("unicode_escape", errors="ignore"))
+                break
+        videos.append(
+            {
+                "title": title or f"YouTube video {video_id}",
+                "channel": "YouTube",
+                "meta": "",
+                "views": "",
+                "length": "",
+                "thumbnail": f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+            }
+        )
+        if len(videos) >= max_results:
+            break
+    return videos
+
+
+def fetch_ytdlp_recommendations(
+    max_results: int,
+    cookies_file: str | None = None,
+    cookies_from_browser: str | None = None,
+) -> list[dict[str, str]]:
+    try:
+        import yt_dlp
+    except ImportError:
+        return []
+
+    query = f"ytsearch{max_results}:인기 동영상"
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "extract_flat": True,
+    }
+    if cookies_file:
+        opts["cookiefile"] = cookies_file
+    if cookies_from_browser:
+        browser, _, profile = cookies_from_browser.partition(":")
+        opts["cookiesfrombrowser"] = (browser, profile or None, None, None)
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(query, download=False)
+    except Exception:
+        return []
+
+    videos: list[dict[str, str]] = []
+    for entry in info.get("entries", []) if isinstance(info, dict) else []:
+        if not isinstance(entry, dict):
+            continue
+        video_id = clean_text(entry.get("id", ""))
+        url = clean_text(entry.get("url", ""))
+        if not is_probable_watch_video_id(video_id):
+            parsed_id = first_youtube_id_from_url(url)
+            video_id = parsed_id if is_probable_watch_video_id(parsed_id) else ""
+        if not video_id:
+            continue
+        videos.append(
+            {
+                "title": clean_text(entry.get("title", "")) or f"YouTube video {video_id}",
+                "channel": clean_text(entry.get("uploader", "") or entry.get("channel", "")) or "YouTube",
+                "meta": "",
+                "views": "",
+                "length": format_duration(entry.get("duration")),
+                "thumbnail": clean_text(entry.get("thumbnail", "")) or f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg",
+                "url": f"https://www.youtube.com/watch?v={video_id}",
+            }
+        )
+    return videos
+
+
+def first_youtube_id_from_url(url: str) -> str:
+    if not url:
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9_-]{11}", url):
+        return url
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname == "youtu.be":
+            return parsed.path.strip("/").split("/", 1)[0]
+        if parsed.hostname and parsed.hostname.endswith("youtube.com"):
+            return urllib.parse.parse_qs(parsed.query).get("v", [""])[0]
+    except Exception:
+        return ""
+    return ""
+
+
+def write_recommendation_debug(page_html: str, initial_data: Any, reason: str) -> None:
+    try:
+        debug_dir = Path(__file__).resolve().parents[1] / "bebug"
+        debug_dir.mkdir(exist_ok=True)
+        (debug_dir / "youtube_recommendations_debug.html").write_text(page_html, encoding="utf-8")
+        if initial_data:
+            (debug_dir / "youtube_recommendations_initial_data.json").write_text(
+                json.dumps(initial_data, ensure_ascii=False, indent=2)[:2_000_000],
+                encoding="utf-8",
+            )
+        key_counts: dict[str, int] = {}
+        for item in walk(initial_data):
+            for key in item:
+                if key.endswith("Renderer") or key.endswith("ViewModel") or key == "watchEndpoint":
+                    key_counts[key] = key_counts.get(key, 0) + 1
+        summary = {
+            "reason": reason,
+            "html_bytes": len(page_html),
+            "has_initial_data": bool(initial_data),
+            "marker_positions": {
+                key: page_html.find(key)
+                for key in ["ytInitialData", "richItemRenderer", "videoRenderer", "lockupViewModel", "watchEndpoint"]
+            },
+            "renderer_counts": dict(sorted(key_counts.items(), key=lambda item: item[1], reverse=True)[:50]),
+            "video_ids_in_html": re.findall(r'"videoId"\s*:\s*"([A-Za-z0-9_-]{11})"', page_html)[:50],
+        }
+        (debug_dir / "youtube_recommendations_summary.json").write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def collect_renderer_videos(node: Any, videos: list[dict[str, str]], seen: set[str]) -> None:
+    if not node or not isinstance(node, (dict, list)):
+        return
+
+    if isinstance(node, list):
+        for child in node:
+            collect_renderer_videos(child, videos, seen)
+        return
+
+    renderer = (
+        node.get("videoRenderer")
+        or node.get("gridVideoRenderer")
+        or node.get("compactVideoRenderer")
+    )
+    if not renderer and isinstance(node.get("richItemRenderer"), dict):
+        content = node["richItemRenderer"].get("content", {})
+        renderer = content.get("videoRenderer") if isinstance(content, dict) else None
+
+    if isinstance(renderer, dict):
+        video_id = clean_text(renderer.get("videoId", ""))
+        if is_probable_watch_video_id(video_id) and video_id not in seen:
+            seen.add(video_id)
+            videos.append(normalize_renderer_video(renderer))
+
+    lockup = node.get("lockupViewModel")
+    if isinstance(lockup, dict):
+        video_id = clean_text(lockup.get("contentId", "")) or first_watch_video_id(lockup)
+        if is_probable_watch_video_id(video_id) and video_id not in seen:
+            seen.add(video_id)
+            videos.append(normalize_lockup_video(lockup))
+
+    for key, value in node.items():
+        if key in {"playerResponse", "playerConfig", "responseContext"}:
+            continue
+        collect_renderer_videos(value, videos, seen)
+
+
+def fetch_youtube_recommendations(
+    max_results: int,
+    cookies_file: str | None = None,
+    cookies_from_browser: str | None = None,
+) -> dict[str, Any]:
+    urls = [
+        "https://www.youtube.com/?hl=ko&gl=KR",
+        "https://www.youtube.com/feed/trending?hl=ko&gl=KR",
+        "https://www.youtube.com/results?search_query=%EC%9D%B8%EA%B8%B0%20%EB%8F%99%EC%98%81%EC%83%81&hl=ko&gl=KR",
+        "https://www.youtube.com/results?search_query=popular%20videos&hl=ko&gl=KR",
+    ]
+    videos: list[dict[str, str]] = []
+    seen: set[str] = set()
+    last_html = ""
+    last_initial_data: Any = None
+    for url in urls:
+        page_html = fetch_html(url)
+        last_html = page_html
+        initial_data = extract_json_blob(page_html, "var ytInitialData")
+        if not initial_data:
+            initial_data = extract_json_blob(page_html, "ytInitialData")
+        last_initial_data = initial_data
+        collect_renderer_videos(initial_data, videos, seen)
+        if not videos:
+            videos.extend(collect_html_video_ids(page_html, max_results))
+        if videos:
+            break
+    if not videos:
+        videos = fetch_ytdlp_recommendations(max_results, cookies_file, cookies_from_browser)
+    if not videos:
+        write_recommendation_debug(last_html, last_initial_data, "No YouTube recommendations found in page data.")
+        raise ValueError("No YouTube recommendations found in the page data.")
+    return {
+        "chips": ["All", "Recommended", "Music", "Live", "Gaming"],
+        "videos": videos[:max_results],
     }
 
 
@@ -629,10 +1091,13 @@ def border(width: int, char: str = "-", color: str | None = None) -> str:
     return paint(b, color) if color else b
 
 
-def nav_bar(width: int, selected: str = "Home", selected_id: str = "") -> list[str]:
+def nav_bar(width: int, selected: str = "Home", selected_id: str = "", logged_in: bool = False) -> list[str]:
     logo = " [>] YouTube "
     inner_w = max(1, width - 2)
-    right = "[+] [user]"
+    account_label = "[user]" if logged_in else "[login]"
+    if selected_id == "account":
+        account_label = paint(account_label, "bright_black")
+    right = "[+] " + account_label
     available_search_w = inner_w - len(logo) - len(right) - 2
     search = ""
     if available_search_w >= 12:
@@ -765,14 +1230,21 @@ def trim_to_height(lines: list[str], height: int, width: int) -> list[str]:
     return flattened[: height - 1] + [fit("...", width)]
 
 
-def render_home_interface(data: dict[str, Any] | None = None, width: int = 120, height: int = 40, selected_id: str = "", scroll_row: int = 0) -> str:
+def render_home_interface(
+    data: dict[str, Any] | None = None,
+    width: int = 120,
+    height: int = 40,
+    selected_id: str = "",
+    scroll_row: int = 0,
+    logged_in: bool = False,
+) -> str:
     width = max(60, width)
     height = max(15, height)
     data = data or sample_home_data()
     sidebar_w = 20 if width >= 100 else 0
     content_w = width - sidebar_w - (2 if sidebar_w else 0)
 
-    header = nav_bar(width, "Home", selected_id)
+    header = nav_bar(width, "Home", selected_id, logged_in=logged_in)
     content_lines: list[str] = []
 
     # Force 3x3 grid
@@ -985,7 +1457,18 @@ def render_ascii_interface(data: dict[str, Any], width: int = 120, height: int =
     return "\n".join(trim_to_height(page_header + [top] + info_lines, height, width))
 
 
-def run_interactive(data: dict[str, Any], width: int, height: int, color_mode: str, api_base: str = None, query: str = None):
+def run_interactive(
+    data: dict[str, Any],
+    width: int,
+    height: int,
+    color_mode: str,
+    api_base: str = None,
+    query: str = None,
+    cookies_file: str | None = None,
+    cookies_from_browser: str | None = None,
+    logged_in: bool = False,
+    max_results: int = 9,
+):
     # Clear screen and move cursor to home
     sys.stdout.write("\033[2J\033[H")
     sys.stdout.flush()
@@ -997,6 +1480,16 @@ def run_interactive(data: dict[str, Any], width: int, height: int, color_mode: s
     need_redraw = True
     is_fetching = False
 
+    # Set terminal to cbreak mode on Unix to capture keys immediately
+    old_settings = None
+    if sys.platform != "win32":
+        try:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+        except Exception:
+            pass
+
     # Pre-calculate layout parameters
     def calc_layout(w, h):
         sidebar_w = 20 if w >= 100 else 0
@@ -1007,10 +1500,48 @@ def run_interactive(data: dict[str, Any], width: int, height: int, color_mode: s
         vis_rows = 3
         c_h = avail_h // vis_rows
         t_h = max(4, min(40, c_h - 6))
-        actual_vis_rows = min(3, max(1, avail_h // (t_h + 6)))
+        actual_vis_rows = max(1, min(3, avail_h // (t_h + 6)))
         return sidebar_w, content_w, cols, hdr_h, avail_h, t_h, actual_vis_rows
 
     sidebar_w, content_w, columns, header_h, available_h, thumb_h, visible_rows = calc_layout(width, height)
+
+    def max_scroll_row() -> int:
+        total_rows = math.ceil(len(data.get("videos", [])) / columns) if columns else 0
+        return max(0, total_rows - visible_rows)
+
+    def clamp_selection_to_scroll() -> None:
+        nonlocal selected_id, scroll_row
+        videos = data.get("videos", [])
+        if not videos:
+            selected_id = "tab_0"
+            scroll_row = 0
+            return
+        scroll_row = max(0, min(scroll_row, max_scroll_row()))
+        if not selected_id.startswith("video_"):
+            return
+        idx = max(0, min(int(selected_id.split("_")[1]), len(videos) - 1))
+        top = scroll_row * columns
+        bottom = min(len(videos) - 1, top + (columns * visible_rows) - 1)
+        if idx < top:
+            idx = top
+        elif idx > bottom:
+            idx = bottom
+        selected_id = f"video_{idx}"
+
+    def scroll_page(delta_rows: int) -> None:
+        nonlocal selected_id, scroll_row
+        videos = data.get("videos", [])
+        if not videos:
+            return
+        scroll_row = max(0, min(scroll_row + delta_rows, max_scroll_row()))
+        if not selected_id.startswith("video_"):
+            selected_id = f"video_{scroll_row * columns}"
+        else:
+            idx = int(selected_id.split("_")[1])
+            col = idx % columns
+            new_idx = min(len(videos) - 1, (scroll_row * columns) + col)
+            selected_id = f"video_{new_idx}"
+        clamp_selection_to_scroll()
     
     def fetch_more_bg():
         nonlocal is_fetching, current_max_results, num_videos, need_redraw
@@ -1027,158 +1558,251 @@ def run_interactive(data: dict[str, Any], width: int, height: int, color_mode: s
         finally:
             is_fetching = False
 
-    while True:
-        if need_redraw:
-            # Move cursor to top
-            sys.stdout.write("\033[H")
-            
-            # Use pre-calculated values
-            ascii_ui = render_home_interface(data, width, height - 1, selected_id=selected_id, scroll_row=scroll_row)
-            if should_use_color(color_mode, None):
-                ascii_ui = colorize_ascii(ascii_ui)
-            
-            # Single atomic write to stdout
-            sys.stdout.write("\n" + ascii_ui)
-            sys.stdout.flush()
-            need_redraw = False
-            need_redraw = False
-        
-        # Wait for key
-        if not msvcrt.kbhit():
-            time.sleep(0.005)
-            continue
-            
-        key = msvcrt.getch()
-        need_redraw = True
-        
-        if key == b'\x1b' or key.lower() == b'q': # Esc or Q
-            break
-            
-        # Handle arrows (Windows)
-        if key in (b'\x00', b'\xe0'):
-            key = msvcrt.getch()
-            # Navigation logic
-            sidebar_w = 20 if width >= 100 else 0
-            columns = 3
-            
-            header_h = 4
-            available_h = height - header_h - 1
-            visible_rows = 3
-            card_h = available_h // visible_rows
-            thumb_h = max(4, min(40, card_h - 6))
-            visible_rows = max(1, available_h // (thumb_h + 6))
-            visible_rows = min(3, visible_rows)
-            
-            if selected_id.startswith("video_"):
-                idx = int(selected_id.split("_")[1])
-                num_videos = len(data.get("videos", []))
-                
-                if key == b'P': # Down
-                    if idx + columns < num_videos:
-                        new_idx = idx + columns
-                        selected_id = f"video_{new_idx}"
-                        if (new_idx // columns) >= scroll_row + visible_rows:
-                            scroll_row += 1
-                elif key == b'H': # Up
-                    if idx >= columns:
-                        new_idx = idx - columns
-                        selected_id = f"video_{new_idx}"
-                        if (new_idx // columns) < scroll_row:
-                            scroll_row = max(0, scroll_row - 1)
-                    else:
-                        selected_id = "tab_0"
-                elif key == b'K': # Left
-                    if idx > 0:
-                        new_idx = idx - 1
-                        selected_id = f"video_{new_idx}"
-                        if (new_idx // columns) < scroll_row:
-                            scroll_row = max(0, (new_idx // columns))
-                elif key == b'M': # Right
-                    if idx < num_videos - 1:
-                        new_idx = idx + 1
-                        selected_id = f"video_{new_idx}"
-                        if (new_idx // columns) >= scroll_row + visible_rows:
-                            scroll_row = (new_idx // columns) - visible_rows + 1
-
-                # Proactive Load More in Background
-                # 영상이 갑자기 추가되는 버그 수정을 위해 트리거 조건을 더 엄격하게 제한
-                if query and api_base and current_max_results < 100 and not is_fetching:
-                    # 마지막 줄에 도달했고, 아래(Down) 혹은 오른쪽(Right)으로 이동 중일 때만 트리거
-                    if (key in (b'P', b'M')) and (idx >= num_videos - 3):
-                        is_fetching = True
-                        threading.Thread(target=fetch_more_bg, daemon=True).start()
-                        
-            elif selected_id.startswith("tab_"):
-                idx = int(selected_id.split("_")[1])
-                if key == b'K': # Left
-                    if idx > 0: selected_id = f"tab_{idx - 1}"
-                elif key == b'M': # Right
-                    if idx < 2: selected_id = f"tab_{idx + 1}" # Max 2 now (Home, Subs, Library)
-                elif key == b'P': # Down
-                    selected_id = "video_0"
-                elif key == b'H': # Up
-                    selected_id = "search"
+    try:
+        while True:
+            try:
+                if need_redraw:
+                    # Move cursor to top
+                    sys.stdout.write("\033[H")
                     
-            elif selected_id == "search":
-                if key == b'P': # Down
-                    selected_id = "tab_0"
-        
-        elif key == b'\r': # Enter
-            if selected_id.startswith("video_"):
-                idx = int(selected_id.split("_")[1])
-                videos = data.get("videos", [])
-                if 0 <= idx < len(videos):
-                    video = videos[idx]
-                    url = video.get("url")
-                    if url:
-                        if url.startswith("/"):
-                            url = "https://www.youtube.com" + url
+                    # Use pre-calculated values
+                    ascii_ui = render_home_interface(
+                        data,
+                        width,
+                        height - 1,
+                        selected_id=selected_id,
+                        scroll_row=scroll_row,
+                        logged_in=logged_in,
+                    )
+                    if should_use_color(color_mode, None):
+                        ascii_ui = colorize_ascii(ascii_ui)
+                    
+                    # Single atomic write to stdout
+                    sys.stdout.write("\n" + ascii_ui)
+                    sys.stdout.flush()
+                    need_redraw = False
+                
+                # Wait for key
+                key = get_input()
+                if key is None:
+                    time.sleep(0.01)
+                    continue
+                    
+                need_redraw = True
+                
+                # Use 'q' or 'esc' as exit keys
+                if key == b'esc' or key.lower() == b'q':
+                    break
+
+                if key in (b'j', b'J'):
+                    key = b'down'
+                elif key in (b'k', b'K'):
+                    key = b'up'
+                elif key in (b' ', b'f', b'F'):
+                    key = b'pagedown'
+                elif key in (b'b', b'B'):
+                    key = b'pageup'
+                elif key in (b'g',):
+                    key = b'home'
+                elif key in (b'G',):
+                    key = b'end'
+
+                if key == b'pagedown':
+                    scroll_page(visible_rows)
+                    continue
+                if key == b'pageup':
+                    scroll_page(-visible_rows)
+                    continue
+                if key == b'home':
+                    scroll_row = 0
+                    if data.get("videos"):
+                        selected_id = "video_0"
+                    continue
+                if key == b'end':
+                    scroll_row = max_scroll_row()
+                    videos = data.get("videos", [])
+                    if videos:
+                        selected_id = f"video_{len(videos) - 1}"
+                        clamp_selection_to_scroll()
+                    continue
+                
+                # Handle arrows
+                is_up = (key == b'up')
+                is_down = (key == b'down')
+                is_left = (key == b'left')
+                is_right = (key == b'right')
+
+                if is_up or is_down or is_left or is_right:
+                    if selected_id.startswith("video_"):
+                        idx = int(selected_id.split("_")[1])
+                        num_videos = len(data.get("videos", []))
                         
-                        # Get path to video_ascii.py
-                        script_dir = os.path.dirname(os.path.abspath(__file__))
-                        player_script = os.path.join(script_dir, "video_ascii.py")
-                        
-                        # Build command
-                        cmd = [sys.executable, player_script, "--url", url]
-                        if should_use_color(color_mode, None):
-                            cmd.append("--color")
-                        
-                        # Fetch suggestions in background or before playing
-                        suggestions = []
-                        if api_base:
-                            sys.stdout.write("\n[i] 추천 영상 정보 가져오는 중...")
+                        if is_down: # Down
+                            if idx + columns < num_videos:
+                                new_idx = idx + columns
+                                selected_id = f"video_{new_idx}"
+                                if (new_idx // columns) >= scroll_row + visible_rows:
+                                    scroll_row += 1
+                        elif is_up: # Up
+                            if idx >= columns:
+                                new_idx = idx - columns
+                                selected_id = f"video_{new_idx}"
+                                if (new_idx // columns) < scroll_row:
+                                    scroll_row = max(0, scroll_row - 1)
+                            else:
+                                selected_id = "tab_0"
+                        elif is_left: # Left
+                            if idx > 0:
+                                new_idx = idx - 1
+                                selected_id = f"video_{new_idx}"
+                                if (new_idx // columns) < scroll_row:
+                                    scroll_row = max(0, (new_idx // columns))
+                        elif is_right: # Right
+                            if idx < num_videos - 1:
+                                new_idx = idx + 1
+                                selected_id = f"video_{new_idx}"
+                                if (new_idx // columns) >= scroll_row + visible_rows:
+                                    scroll_row = (new_idx // columns) - visible_rows + 1
+
+                        # Proactive Load More in Background
+                        if query and api_base and current_max_results < 100 and not is_fetching:
+                            if (is_down or is_right) and (idx >= num_videos - 3):
+                                is_fetching = True
+                                threading.Thread(target=fetch_more_bg, daemon=True).start()
+                                
+                    elif selected_id.startswith("tab_"):
+                        idx = int(selected_id.split("_")[1])
+                        if is_left: # Left
+                            if idx > 0: selected_id = f"tab_{idx - 1}"
+                        elif is_right: # Right
+                            if idx < 2: selected_id = f"tab_{idx + 1}" # Max 2 now (Home, Subs, Library)
+                        elif is_down: # Down
+                            selected_id = "video_0"
+                        elif is_up: # Up
+                            selected_id = "search"
+                            
+                    elif selected_id == "search":
+                        if is_down: # Down
+                            selected_id = "tab_0"
+                        elif is_right:
+                            selected_id = "account"
+                            
+                    elif selected_id == "account":
+                        if is_left:
+                            selected_id = "search"
+                        elif is_down:
+                            selected_id = "tab_2"
+                
+                elif key == b'enter': # Enter
+                    if selected_id == "account":
+                        if not logged_in:
+                            if old_settings:
+                                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                            sys.stdout.write("\033[?25h\033[2J\033[H")
+                            sys.stdout.write("[i] 브라우저에서 YouTube 로그인 페이지를 여는 중...\n")
                             sys.stdout.flush()
                             try:
-                                v_data = fetch_api_video(api_base, url)
-                                suggestions = v_data.get("suggestions", [])
-                            except:
-                                pass
-                        
-                        # Fallback: API에서 추천 영상을 못 가져오면 현재 리스트에서 다른 영상들을 추천으로 표시
-                        if not suggestions and data.get("videos"):
-                            all_vids = data["videos"]
-                            # 현재 재생 중인 영상을 제외한 다른 영상들 8개 추출
-                            suggestions = [v for i, v in enumerate(all_vids) if i != idx][:8]
-                        
-                        if suggestions:
-                            cmd.extend(["--suggestions", json.dumps(suggestions)])
-                        
-                        # Clear screen and show cursor before running player
-                        sys.stdout.write("\033[?25h\033[2J\033[H")
-                        sys.stdout.flush()
-                        
-                        try:
-                            # Run the video player
-                            subprocess.run(cmd)
-                        except KeyboardInterrupt:
-                            pass
-                        except Exception as e:
-                            print(f"\n[error] Failed to start video player: {e}")
-                            time.sleep(2)
-                        
-                        # Restore UI state: hide cursor and clear screen
-                        sys.stdout.write("\033[?25l\033[2J\033[H")
-                        sys.stdout.flush()
+                                webbrowser.open("https://www.youtube.com/", new=2)
+                                input(
+                                    "브라우저에서 YouTube 로그인을 완료한 뒤 여기서 Enter를 누르세요. "
+                                    "쿠키는 브라우저에서만 읽습니다."
+                                )
+                                if cookies_file or cookies_from_browser:
+                                    cookies_from_browser = cookies_from_browser or "chrome"
+                                    print(f"[i] {cookies_from_browser} 로그인 쿠키를 읽는 중...")
+                                    configure_cookies(cookies_file, cookies_from_browser)
+                                else:
+                                    print("[i] 설치된 브라우저에서 로그인 쿠키를 찾는 중...")
+                                    cookies_from_browser = configure_first_available_browser_cookies()
+                                    print(f"[i] {cookies_from_browser} 쿠키를 사용합니다.")
+                                logged_in = REQUEST_COOKIE_JAR is not None
+                                if logged_in and not query:
+                                    new_data = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
+                                    data["videos"] = new_data.get("videos", data.get("videos", []))
+                                    current_max_results = len(data.get("videos", []))
+                                    num_videos = current_max_results
+                            except Exception as e:
+                                print(f"[!] 로그인 쿠키 로드 실패: {e}")
+                                time.sleep(2)
+                            if old_settings:
+                                tty.setcbreak(fd)
+                            sys.stdout.write("\033[?25l\033[2J\033[H")
+                            sys.stdout.flush()
+                    elif selected_id.startswith("video_"):
+                        idx = int(selected_id.split("_")[1])
+                        videos = data.get("videos", [])
+                        if 0 <= idx < len(videos):
+                            video = videos[idx]
+                            url = video.get("url")
+                            if url:
+                                if url.startswith("/"):
+                                    url = "https://www.youtube.com" + url
+                                
+                                # Restore terminal for subprocess
+                                if old_settings:
+                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                                
+                                # Get path to video_ascii.py
+                                script_dir = os.path.dirname(os.path.abspath(__file__))
+                                player_script = os.path.join(script_dir, "video_ascii.py")
+                                
+                                # Build command
+                                cmd = [sys.executable, player_script, "--url", url]
+                                if should_use_color(color_mode, None):
+                                    cmd.append("--color")
+                                if cookies_file:
+                                    cmd.extend(["--cookies", cookies_file])
+                                if cookies_from_browser:
+                                    cmd.extend(["--cookies-from-browser", cookies_from_browser])
+                                
+                                # Fetch suggestions
+                                suggestions = []
+                                if api_base:
+                                    sys.stdout.write("\n[i] 추천 영상 정보 가져오는 중...")
+                                    sys.stdout.flush()
+                                    try:
+                                        v_data = fetch_api_video(api_base, url)
+                                        suggestions = v_data.get("suggestions", [])
+                                    except:
+                                        pass
+                                
+                                if not suggestions and data.get("videos"):
+                                    all_vids = data["videos"]
+                                    suggestions = [v for i, v in enumerate(all_vids) if i != idx][:8]
+                                
+                                if suggestions:
+                                    cmd.extend(["--suggestions", json.dumps(suggestions)])
+                                
+                                sys.stdout.write("\033[?25h\033[2J\033[H")
+                                sys.stdout.flush()
+                                
+                                try:
+                                    subprocess.run(cmd)
+                                except KeyboardInterrupt:
+                                    pass
+                                except Exception as e:
+                                    print(f"\n[error] Failed to start video player: {e}")
+                                    time.sleep(2)
+                                
+                                # Re-set cbreak for UI
+                                if old_settings:
+                                    tty.setcbreak(fd)
+                                sys.stdout.write("\033[?25l\033[2J\033[H")
+                                sys.stdout.flush()
+            except Exception as e:
+                # Log error and exit safely
+                if old_settings:
+                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                sys.stdout.write("\033[?25h\033[2J\033[H")
+                print(f"[Fatal Error in Loop] {e}")
+                import traceback
+                traceback.print_exc()
+                sys.exit(1)
+    finally:
+        # Restore terminal on exit
+        if old_settings:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
 
 
 def main():
@@ -1189,7 +1813,7 @@ def main():
     parser.add_argument("--page", choices=["home", "watch"], default="home", help="Mock page to render without URL")
     parser.add_argument("--search", "-s", help="Search query to render with /api/youtube/search")
     parser.add_argument("--api-base", default="http://127.0.0.1:3000", help="YouTube API server base URL")
-    parser.add_argument("--max-results", type=int, default=9, help="Maximum search results to request from the API")
+    parser.add_argument("--max-results", type=int, default=30, help="Maximum videos to load. Default: 30")
     parser.add_argument("--width", type=int, help="ASCII output width. Default: current terminal width")
     parser.add_argument("--height", type=int, help="ASCII output height. Default: current terminal height")
     parser.add_argument(
@@ -1201,6 +1825,19 @@ def main():
     parser.add_argument("--output", "-o", help="Optional output file (.txt)")
     parser.add_argument("--select", help="ID of the component to select (search, video_0, etc.)")
     parser.add_argument("--interactive", "-i", action="store_true", help="Run in interactive mode")
+    parser.add_argument(
+        "--login",
+        nargs="?",
+        const="chrome",
+        metavar="BROWSER[:PROFILE]",
+        help="Use YouTube login cookies from a browser. Default browser when omitted: chrome",
+    )
+    parser.add_argument(
+        "--cookies-from-browser",
+        metavar="BROWSER[:PROFILE]",
+        help="Read YouTube cookies from a browser, e.g. chrome, safari, firefox, brave:Default",
+    )
+    parser.add_argument("--cookies", metavar="FILE", help="Read YouTube cookies from a Netscape cookies.txt file")
     args = parser.parse_args()
 
     if sys.platform == "win32":
@@ -1210,6 +1847,12 @@ def main():
             pass
 
     width, height = resolve_output_size(args.width, args.height)
+    cookies_from_browser = args.cookies_from_browser or args.login
+    try:
+        configure_cookies(args.cookies, cookies_from_browser)
+    except Exception as exc:
+        print(f"[warning] Could not load YouTube login cookies: {exc}", file=sys.stderr)
+    logged_in = REQUEST_COOKIE_JAR is not None
     
     if args.search:
         data = fetch_api_search(args.api_base, args.search, args.max_results)
@@ -1218,18 +1861,39 @@ def main():
     elif args.page == "watch":
         data = sample_watch_data()
     else:
-        data = sample_home_data()
+        try:
+            data = fetch_youtube_recommendations(args.max_results, args.cookies, cookies_from_browser)
+        except Exception as exc:
+            print(f"[warning] Could not fetch YouTube recommendations: {exc}", file=sys.stderr)
+            data = sample_home_data()
 
     if args.interactive or (not args.output and sys.stdin.isatty()):
         sys.stdout.write("\033[?25l")
         try:
-            run_interactive(data, width, height, args.color, api_base=args.api_base, query=args.search)
+            run_interactive(
+                data,
+                width,
+                height,
+                args.color,
+                api_base=args.api_base,
+                query=args.search,
+                cookies_file=args.cookies,
+                cookies_from_browser=cookies_from_browser,
+                logged_in=logged_in,
+                max_results=args.max_results,
+            )
         finally:
             # Show cursor and clear screen on exit
             sys.stdout.write("\033[?25h\033[2J\033[H")
             sys.stdout.flush()
     else:
-        ascii_ui = render_home_interface(data, width, height, selected_id=args.select or "")
+        ascii_ui = render_home_interface(
+            data,
+            width,
+            height,
+            selected_id=args.select or "",
+            logged_in=logged_in,
+        )
         if should_use_color(args.color, args.output):
             ascii_ui = colorize_ascii(ascii_ui)
         if args.output:

@@ -3,5 +3,5 @@
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-source "$PROJECT_DIR/venv_ascii/bin/activate"
+source "/Users/gangmilan/Downloads/coding/turtube/venv_ascii/bin/activate"
 python "$PROJECT_DIR/src/video_ascii.py" "$@"

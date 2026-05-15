@@ -1,0 +1,36 @@
+{
+  "reason": "No YouTube recommendations found in page data.",
+  "html_bytes": 709493,
+  "has_initial_data": true,
+  "marker_positions": {
+    "ytInitialData": 626678,
+    "richItemRenderer": -1,
+    "videoRenderer": -1,
+    "lockupViewModel": -1,
+    "watchEndpoint": -1
+  },
+  "renderer_counts": {
+    "hotkeyDialogSectionOptionRenderer": 28,
+    "buttonRenderer": 8,
+    "hotkeyDialogSectionRenderer": 4,
+    "buttonViewModel": 2,
+    "twoColumnBrowseResultsRenderer": 1,
+    "tabRenderer": 1,
+    "richGridRenderer": 1,
+    "richSectionRenderer": 1,
+    "feedNudgeRenderer": 1,
+    "feedTabbedHeaderRenderer": 1,
+    "desktopTopbarRenderer": 1,
+    "topbarLogoRenderer": 1,
+    "fusionSearchboxRenderer": 1,
+    "dialogViewModel": 1,
+    "dialogHeaderViewModel": 1,
+    "panelFooterViewModel": 1,
+    "basicContentViewModel": 1,
+    "topbarMenuButtonRenderer": 1,
+    "multiPageMenuRenderer": 1,
+    "hotkeyDialogRenderer": 1,
+    "voiceSearchDialogRenderer": 1
+  },
+  "video_ids_in_html": []
+}

@@ -1043,9 +1043,22 @@ class AsciiVideoPipeline:
             except queue.Empty:
                 break
 
-    def _producer(self, cap: cv2.VideoCapture):
-        """별도 스레드에서 프레임을 미리 ASCII로 변환해 버퍼링."""
+    def _producer(self, cap: cv2.VideoCapture, fps_target: float):
+        """별도 스레드에서 프레임을 미리 ASCII로 변환해 버퍼링.
+           재생 시작 시점(t_start)이 설정되면 그에 맞춰 프레임을 스킵함."""
+        frame_idx = 0
         while not self._stop.is_set():
+            # [동적 스킵] 재생이 시작되었고 변환 속도가 뒤처지면 입력 단계에서 스킵
+            if getattr(self, "t_start", None) is not None:
+                elapsed = time.perf_counter() - self.t_start
+                expected_idx = int(elapsed * fps_target)
+                if frame_idx < expected_idx:
+                    skip_count = expected_idx - frame_idx
+                    for _ in range(skip_count):
+                        if not cap.grab():
+                            break
+                    frame_idx = expected_idx
+
             ret, frame = cap.read()
             if not ret:
                 try:
@@ -1055,15 +1068,22 @@ class AsciiVideoPipeline:
                 break
 
             ascii_str = self.conv.convert_frame(frame)
+            frame_idx += 1
             out_lines = ascii_str.count("\n") + 1
             payload = (ascii_str, out_lines, self.conv.width, out_lines)
 
             while not self._stop.is_set():
                 try:
-                    self._q.put(payload, timeout=0.2)
-                    break
+                    # 큐가 꽉 찼을 때 너무 오래 대기하지 않음 (스킵 기회 확보)
+                    if self._q.put(payload, timeout=0.05):
+                        break
                 except queue.Full:
                     self._render_blocked += 1
+                    # 만약 재생 중이라면 큐가 빌 때까지 기다리지 않고 다음 프레임 시도로 넘어감 (스킵 유도)
+                    if getattr(self, "t_start", None) is not None:
+                        break
+                    continue
+                break
 
     def _visual_len(self, s):
         """ANSI 코드를 제외한 문자열의 실제 출력 너비 계산 (한글 2칸 고려)"""
@@ -1139,190 +1159,175 @@ class AsciiVideoPipeline:
             self._stop.clear()
             self._render_blocked = 0
             self._reset_queue(fps_target, webcam)
-            t = threading.Thread(target=self._producer, args=(cap,), daemon=True)
+            self.t_start = None # 초기화 (재생 전)
+            
+            t = threading.Thread(target=self._producer, args=(cap, fps_target), daemon=True)
             t.start()
 
-            # 오디오 시작 (ffplay 활용)
+            # ── 프리버퍼링 (웹캠이 아닐 때만) ───────────────────────────────
+            if not webcam:
+                sys.stdout.write(f"\n[i] 버퍼링 중 ({self.buffer_seconds}초)... ")
+                sys.stdout.flush()
+                # 버퍼가 50% 이상 찰 때까지 최대 5초 대기
+                wait_start = time.perf_counter()
+                while self._q.qsize() < self._q.maxsize * 0.5 and (time.perf_counter() - wait_start < 5.0):
+                    time.sleep(0.1)
+                sys.stdout.write("완료!\n")
+                sys.stdout.flush()
+
+            # ── 재생 시작 및 오디오 동기화 ──────────────────────────────────
+            # ffplay startup delay 보정 (약 0.15초)
+            audio_delay_compensation = 0.15
+            self.t_start = time.perf_counter() + audio_delay_compensation
+            
             audio_proc = None
             if audio_url:
                 try:
-                    # ffplay -nodisp: 화면 없이, -autoexit: 종료 시 자동 닫힘, -vn: 비디오 제외
                     cmd = ["ffplay", "-nodisp", "-autoexit", "-vn", "-loglevel", "quiet", audio_url]
-                    # 윈도우에서 콘솔 창이 뜨지 않도록 설정
                     startupinfo = None
                     if platform.system() == "Windows":
                         startupinfo = subprocess.STARTUPINFO()
                         startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                        startupinfo.wShowWindow = 0 # SW_HIDE
-                    
+                        startupinfo.wShowWindow = 0 
                     audio_proc = subprocess.Popen(cmd, startupinfo=startupinfo)
-                except Exception as e:
-                    pass # ffplay가 없으면 소리 없이 진행
+                except Exception:
+                    pass
 
             if hide_cursor:
                 sys.stdout.write("\x1b[?25l")
 
-            # 초기 터미널 크기 기록 (리사이즈 감지용)
             prev_term_size = get_terminal_size()
-            prev_out_lines = 0   # 이전 프레임 출력 줄 수
+            prev_out_lines = 0   
 
             try:
                 frame_count = 0
-                drops_local = 0
                 fps_display = fps_target
-                t0 = time.perf_counter()
-                t_start = t0  # 동기화 기준 시간
-
+                
                 while True:
-                    # [동기화] 현재 시간에 맞춰야 할 기대 프레임 번호 계산 및 뒤처진 프레임 스킵
-                    expected_frame = int((time.perf_counter() - t_start) * fps_target)
-                    while frame_count < expected_frame:
+                    # 1. 동기화: 현재 시각에 출력되어야 할 '목표 프레임 번호' 계산
+                    now = time.perf_counter()
+                    
+                    # 아직 재생 시작 전(보정 시간)이면 대기
+                    if now < self.t_start:
+                        time.sleep(0.01)
+                        continue
+
+                    elapsed = now - self.t_start
+                    expected_frame_idx = int(elapsed * fps_target)
+
+                    # 2. 소비자 사이드 프레임 스킵 (너무 늦은 프레임 버림)
+                    # 단, 너무 많이 버리지 않도록 큐 상황에 따라 조절
+                    while frame_count < expected_frame_idx:
                         try:
-                            self._q.get_nowait()
+                            temp = self._q.get_nowait()
+                            if temp is None: break 
                             frame_count += 1
-                        except: break
+                        except queue.Empty:
+                            break
 
-                    # ── 프레임 시작 시점 기록 (sleep 계산 기준) ──────────────
-                    t_frame_start = time.perf_counter()
+                    # 3. 현재 출력할 프레임 가져오기
+                    try:
+                        # 큐가 비어있으면 아주 잠깐 기다림
+                        item = self._q.get(timeout=0.1)
+                    except queue.Empty:
+                        if not webcam and frame_count >= total and total > 0:
+                            break
+                        continue
 
-                    # ── 큐에서 미리 변환된 ASCII 프레임 가져오기 ──────────────
-                    item = self._q.get(timeout=2)
                     if item is None:
                         break
 
-                    ascii_str, out_lines, frame_w, frame_h = item
-                    drops_local = self._render_blocked
+                    # [추가] 영상이 오디오보다 너무 빨리 왔을 경우 대기
+                    # 목표 시간보다 현재 시간이 빠르면 그만큼 쉰다
+                    target_time = self.t_start + (frame_count / fps_target)
+                    wait_before_render = target_time - time.perf_counter()
+                    if wait_before_render > 0.005:
+                        time.sleep(wait_before_render)
 
-                    # ── 터미널 리사이즈 감지 (매 10프레임마다만 확인) ──────────────
-                    if frame_count % 10 == 0:
+                    ascii_str, out_lines, frame_w, frame_h = item
+                    
+                    # 4. 터미널 리사이즈 및 출력 (기존 로직 유지하되 최적화)
+                    if frame_count % 15 == 0:
                         cur_term_size = get_terminal_size()
-                        resized = cur_term_size != prev_term_size
-                        if resized:
-                            # 화면 전체 클리어 후 재출력
+                        if cur_term_size != prev_term_size:
                             sys.stdout.write("\x1b[2J\x1b[H")
                             prev_term_size = cur_term_size
-                            prev_out_lines = 0
                             self._drain_render_queue()
                     else:
                         cur_term_size = prev_term_size
 
-                    # ── 렌더 병목 감지 및 품질 자동 조정 ──────────────
-                    if drops_local > 10 and frame_count % 30 == 0:
-                        old_width = self.conv.width
-                        # 너비를 5% 줄임 (최소 40)
-                        new_width = max(40, int(self.conv.width * 0.95))
-                        if new_width != old_width:
-                            self.conv.width = new_width
-                            sys.stderr.write(f"\n[i] 성능 최적화: 너비 {old_width} → {new_width}\n")
-                            sys.stderr.flush()
-                            self._render_blocked = 0
-                            self._drain_render_queue()
-
-                    # 출력 줄 수가 바뀌면(해상도 변경) 화면 클리어
-                    if prev_out_lines and out_lines != prev_out_lines:
-                        sys.stdout.write("\x1b[2J\x1b[H")
-                        prev_out_lines = 0
-
-                    # ── 출력 최적화 ──────────────────────────────────────────────
-                    # 절대적 홈 이동(\x1b[H) 사용으로 화면 흔들림 원천 봉쇄
-                    move_cursor = "\x1b[H"
-                    
-                    # 상태바 (LED 효과)
-                    frame_count += 1
+                    # 출력 스트링 조립
                     cols, rows = cur_term_size
-                    drop_indicator = f" (버퍼대기:{drops_local})" if drops_local > 0 else ""
-                    s_count = len(suggestions) if suggestions else 0
                     status = (
-                        f" FPS:{fps_display:5.1f} | "
+                        f" FPS:{fps_display:4.1f} | "
                         f"프레임:{frame_count}" + (f"/{total}" if total > 0 else "") +
-                        f" | {cols}×{rows}터미널 → {frame_w}×{frame_h}출력"
-                        f" | {BACKEND.upper()}{drop_indicator} | 추천:{s_count}"
+                        f" | {frame_w}x{frame_h} | {BACKEND.upper()}"
                     )
-                    status = status[:cols - 1].ljust(cols - 1)
+                    status = status[:cols-1].ljust(cols-1)
                     
-                    # 터미널 높이를 초과하지 않도록 출력 줄 수 제한 (더 보수적으로 제한)
-                    max_allowed_rows = max(10, rows - 3)
+                    # 화면 하단에 상태바 배치
+                    max_rows = rows - 2
+                    v_lines = ascii_str.splitlines()[:max_rows]
                     
-                    if (suggestions is not None) and cols >= 100:
-                        # 사이드바 너비를 남는 공간에 맞춰 더 보수적으로 계산 (여유 10칸 확보)
-                        sidebar_w = min(60, cols - frame_w - 10)
-                        if sidebar_w < 20: 
-                            sidebar_w = 0
-                        
-                        # 사이드바 갱신 조건: 로딩된 섬네일 수 변경 or 터미널 너비 변경 or 애니메이션 틱(0.5초)
-                        thumb_count = len(getattr(self, '_thumb_ascii_cache', {}))
-                        anim_tick = int(time.time() * 2) 
-                        needs_refresh = (not hasattr(self, '_sidebar_cache') or 
-                                         self._sidebar_cache_w != sidebar_w or 
-                                         getattr(self, '_last_thumb_count', -1) != thumb_count or
-                                         getattr(self, '_last_anim_tick', -1) != anim_tick)
-                        
-                        if needs_refresh and sidebar_w > 0:
-                            self._sidebar_cache = self._render_sidebar_lines(suggestions, sidebar_w)
-                            self._sidebar_cache_w = sidebar_w
-                            self._last_thumb_count = thumb_count
-                            self._last_anim_tick = anim_tick
-                        
-                        v_lines = ascii_str.splitlines()
-                        s_lines = self._sidebar_cache if sidebar_w > 0 else []
-                        
-                        # ── 고성능 좌표 기반 렌더링 ────────────────────────────────────
-                        # 1. 영상을 먼저 홈 위치(\x1b[H)에서 출력
-                        v_output = "\x1b[H" + "\n".join([line + "\x1b[K" for line in v_lines[:max_allowed_rows]])
-                        sys.stdout.write(v_output)
-                        
-                        # 2. 사이드바를 절대 좌표로 덮어쓰기 (frame_w + 6 위치로 더 밀어냄)
-                        if sidebar_w > 0:
-                            sidebar_pos_x = frame_w + 6
-                            sidebar_output = []
-                            for i, sl in enumerate(s_lines[:max_allowed_rows]):
-                                # i+1 행, sidebar_pos_x 열로 커서 이동 후 출력
-                                sidebar_output.append(f"\x1b[{i+1};{sidebar_pos_x}H{sl}")
-                            sys.stdout.write("".join(sidebar_output))
-                        
-                        # 3. 상태바를 영상/사이드바 아래에 배치
-                        status_y = max(len(v_lines), len(s_lines)) + 1
-                        status_y = min(status_y, rows)
-                        sys.stdout.write(f"\x1b[{status_y};1H\x1b[38;2;0;255;0m{status}\x1b[0m\x1b[K")
-                        
-                        out_lines = max_allowed_rows
-                    else:
-                        v_lines = ascii_str.splitlines()[:max_allowed_rows]
-                        sys.stdout.write("\x1b[H" + "\n".join([line + "\x1b[K" for line in v_lines]))
-                        sys.stdout.write(f"\n\x1b[38;2;0;255;0m{status}\x1b[0m\x1b[K")
-                        out_lines = len(v_lines)
+                    # atomic write: 전체 화면을 한 번에 업데이트 (깜빡임 최소화)
+                    output = ["\x1b[H"]
+                    output.extend([line + "\x1b[K" for line in v_lines])
+                    
+                    # 사이드바 (추천 영상) 처리 로직 (생략된 경우 통합)
+                    if (suggestions is not None) and cols >= 110:
+                        sidebar_w = min(50, cols - frame_w - 8)
+                        if sidebar_w > 15:
+                            # 사이드바 캐시 렌더링...
+                            if not hasattr(self, '_sidebar_cache') or self._sidebar_cache_w != sidebar_w:
+                                self._sidebar_cache = self._render_sidebar_lines(suggestions, sidebar_w)
+                                self._sidebar_cache_w = sidebar_w
+                            
+                            s_lines = self._sidebar_cache
+                            for i, sl in enumerate(s_lines[:len(v_lines)]):
+                                # ANSI 이스케이프: i+1행, frame_w+4열로 이동
+                                output.append(f"\x1b[{i+1};{frame_w+4}H{sl}")
 
-                    prev_out_lines = out_lines + 1
-
-                    now = time.perf_counter()
-                    fps_display = frame_count / (now - t0)
+                    # 상태바 추가
+                    status_y = len(v_lines) + 1
+                    output.append(f"\x1b[{status_y};1H\x1b[32m{status}\x1b[0m\x1b[K")
+                    
+                    sys.stdout.write("".join(output))
                     sys.stdout.flush()
 
-                    # [동기화] 소리보다 앞서가고 있을 때만 대기
-                    elapsed_frame = now - t_frame_start
-                    # 다음 프레임이 나와야 할 절대 시간과 현재 시간 비교
-                    next_expected_t = t_start + ((frame_count + 1) * frame_delay)
-                    sleep_t = next_expected_t - now
+                    # 5. 다음 프레임까지 대기 (이미 늦었으면 대기 없이 즉시 루프)
+                    frame_count += 1
+                    next_frame_time = self.t_start + (frame_count * frame_delay)
+                    wait_time = next_frame_time - time.perf_counter()
                     
-                    if sleep_t > 0.001:
-                        time.sleep(min(sleep_t, frame_delay))
+                    if wait_time > 0.002:
+                        time.sleep(wait_time)
+                    
+                    # FPS 계산 (디스플레이용)
+                    if frame_count % 10 == 0:
+                        fps_display = frame_count / (time.perf_counter() - self.t_start)
+
 
             except KeyboardInterrupt:
                 print("\n[i] 중단됨")
                 self._stop.set()
             finally:
                 self._stop.set()
+                # ── 안전한 종료 순서 보장 (Race Condition 방지) ──
+                # 1. 쓰레드가 종료될 때까지 대기
+                if t.is_alive():
+                    t.join(timeout=1)
+                # 2. 그 다음 비디오 캡처 객체 해제
                 cap.release()
-                t.join(timeout=2)
                 
                 if hide_cursor:
                     self._set_cursor_visible(True)
                     sys.stdout.write("\x1b[?25h")
                 
-                # 오디오 프로세스 종료
+                # 3. 오디오 프로세스 종료
                 if audio_proc:
                     try:
                         audio_proc.terminate()
+                        audio_proc.wait(timeout=1)
                     except: pass
             
             if not loop or webcam:
@@ -1586,7 +1591,9 @@ class YtDlpSource:
 
     def __init__(self, url: str, quality: int = 1080,
                  keep_file: bool = False, download_dir: str = None,
-                 terminal_mode: bool = False):
+                 terminal_mode: bool = False,
+                 cookies: str = None,
+                 cookies_from_browser: str = None):
         self.url = url
         # 터미널 실시간 모드면 네트워크 차단여 화질 자동 성정
         if terminal_mode:
@@ -1596,6 +1603,8 @@ class YtDlpSource:
         self.keep_file = keep_file
         self.download_dir = download_dir or tempfile.gettempdir()
         self._tmp_path: str = None
+        self.cookies = cookies
+        self.cookies_from_browser = cookies_from_browser
 
         try:
             import yt_dlp
@@ -1604,11 +1613,42 @@ class YtDlpSource:
             print("[!] yt-dlp 미설치: pip install yt-dlp")
             sys.exit(1)
 
+    def _ydl_opts(self, **opts) -> dict:
+        opts.setdefault("ignoreconfig", True)
+        if self.cookies:
+            opts["cookiefile"] = self.cookies
+        if self.cookies_from_browser:
+            browser, _, profile = self.cookies_from_browser.partition(":")
+            opts["cookiesfrombrowser"] = (browser, profile or None, None, None)
+        return opts
+
     # ── 정보 조회 ─────────────────────────────
     def get_info(self) -> dict:
-        opts = {"quiet": True, "no_warnings": True, "skip_download": True}
-        with self._ydl.YoutubeDL(opts) as ydl:
-            return ydl.extract_info(self.url, download=False)
+        formats = [
+            f"bv*[height<={self.quality}]+ba/b[height<={self.quality}]/bv*+ba/best",
+            "best",
+            None,
+        ]
+        last_error = None
+        for fmt in formats:
+            opts = self._ydl_opts(
+                quiet=True,
+                no_warnings=True,
+                skip_download=True,
+                ignore_no_formats_error=True,
+            )
+            if fmt:
+                opts["format"] = fmt
+            try:
+                with self._ydl.YoutubeDL(opts) as ydl:
+                    info = ydl.extract_info(self.url, download=False)
+                if info:
+                    return info
+            except Exception as exc:
+                last_error = exc
+        if last_error:
+            raise last_error
+        raise RuntimeError("yt-dlp가 영상 정보를 반환하지 않았습니다.")
 
     def print_info(self, info: dict):
         title    = info.get("title", "알 수 없음")
@@ -1702,15 +1742,19 @@ class YtDlpSource:
         safe_title = _re.sub(r'[\\/:*?"<>|]', '_', info.get("title", "video"))[:60]
         out_tmpl = os.path.join(self.download_dir, f"{safe_title}.%(ext)s")
 
-        fmt = f"bestvideo[height<={self.quality}][ext=mp4]+bestaudio[ext=m4a]/best[height<={self.quality}]/best"
+        fmt = (
+            f"bestvideo[height<={self.quality}][ext=mp4]+bestaudio[ext=m4a]/"
+            f"bestvideo[height<={self.quality}]+bestaudio/"
+            f"best[height<={self.quality}]/best"
+        )
 
-        opts = {
-            "format": fmt,
-            "outtmpl": out_tmpl,
-            "quiet": False,
-            "no_warnings": True,
-            "merge_output_format": "mp4",
-        }
+        opts = self._ydl_opts(
+            format=fmt,
+            outtmpl=out_tmpl,
+            quiet=False,
+            no_warnings=True,
+            merge_output_format="mp4",
+        )
 
         print(f"[↓] 다운로드 중 ({self.quality}p 이하 최고화질)...")
         with self._ydl.YoutubeDL(opts) as ydl:
@@ -1813,6 +1857,12 @@ def main():
     parser.add_argument("--backend", choices=["auto", "cuda", "mlx", "cupy", "cpu"],
                         default="auto", help="강제 백엔드 선택")
     parser.add_argument("--suggestions", help="JSON string of suggested videos")
+    parser.add_argument("--cookies", metavar="FILE", help="yt-dlp에 전달할 Netscape cookies.txt 파일")
+    parser.add_argument(
+        "--cookies-from-browser",
+        metavar="BROWSER[:PROFILE]",
+        help="yt-dlp가 브라우저 로그인 쿠키를 읽게 함. 예: chrome, safari, firefox, brave:Default",
+    )
 
     args = parser.parse_args()
 
@@ -1839,10 +1889,16 @@ def main():
             url=args.url,
             quality=args.quality,
             keep_file=args.keep_download,
-            terminal_mode=not is_export  # 터미널 모드면 화질 자동 최적화
+            terminal_mode=not is_export,  # 터미널 모드면 화질 자동 최적화
+            cookies=args.cookies,
+            cookies_from_browser=args.cookies_from_browser,
         )
         print(f"\n[yt-dlp] URL 분석 중...")
-        info = yt_source.get_info()
+        try:
+            info = yt_source.get_info()
+        except Exception as exc:
+            print(f"[!] URL 분석 실패: {exc}")
+            sys.exit(1)
         yt_source.print_info(info)
 
         output_ext = Path(args.output).suffix.lower() if args.output else ""
