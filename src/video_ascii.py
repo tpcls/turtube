@@ -181,12 +181,15 @@ if BACKEND == "cpu":
         pass
 
 # 3. MLX (Apple Silicon)
-if BACKEND == "cpu":
-    mlx_spec = importlib.util.find_spec("mlx.core")
-    mlx_auto_enabled = os.environ.get("VIDEO_ASCII_ENABLE_MLX_AUTO") == "1"
-    if mlx_spec is not None and platform.system() == "Darwin" and platform.machine() == "arm64" and mlx_auto_enabled:
-        BACKEND = "mlx"
-        print("[✓] MLX 백엔드 감지 (Apple Silicon)")
+if BACKEND == "cpu" and platform.system() == "Darwin" and platform.machine() == "arm64":
+    try:
+        mlx_spec = importlib.util.find_spec("mlx.core")
+        mlx_auto_enabled = os.environ.get("VIDEO_ASCII_ENABLE_MLX_AUTO") == "1"
+        if mlx_spec is not None and mlx_auto_enabled:
+            BACKEND = "mlx"
+            print("[✓] MLX 백엔드 감지 (Apple Silicon)")
+    except (ImportError, AttributeError):
+        pass
 
 # 4. CuPy (NVIDIA GPU alternative)
 if BACKEND == "cpu":
