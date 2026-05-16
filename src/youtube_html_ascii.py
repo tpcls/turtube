@@ -1596,15 +1596,14 @@ def render_home_interface(
             
     is_dl_mode = data.get("download_mode", False)
     dl_label = "[●] Downloads" if is_dl_mode else "Downloads"
-    dl_item_line = side_item(dl_label, "side_3")
+    dl_item_line = side_item(dl_label, "side_2")
     # Paint red if download mode active
-    if is_dl_mode and selected_id != "side_3":
+    if is_dl_mode and selected_id != "side_2":
         dl_item_line = "|" + paint(fit("  " + dl_label, sidebar_w - 2), "red") + "|"
-    elif is_dl_mode and selected_id == "side_3":
+    elif is_dl_mode and selected_id == "side_2":
         dl_item_line = paint("|", "bright_black") + paint(fit("> " + dl_label, sidebar_w - 2), "red") + paint("|", "bright_black")
     sidebar.extend([
         side_item("History", "side_1"),
-        side_item("Playlists", "side_2"),
         dl_item_line,
         border(sidebar_w),
     ])
@@ -2075,7 +2074,7 @@ def run_interactive(
                             if idx < len(subs) - 1: selected_id = f"sub_{idx + 1}"
                             else: selected_id = "side_1"
                         else:
-                            if idx < 4: selected_id = f"side_{idx + 1}"
+                            if idx < 3: selected_id = f"side_{idx + 1}"
                     elif is_right:
                         # Re-calculate columns for dynamic grid entry
                         _, _, current_cols, _ = calc_layout(width, height)
@@ -2227,23 +2226,8 @@ def run_interactive(
                         time.sleep(2)
                     sys.stdout.write("\033[2J\033[H")
                     sys.stdout.flush()
-                elif selected_id == "side_3": # Downloads mode toggle
+                elif selected_id == "side_2": # Downloads mode toggle
                     data["download_mode"] = not data.get("download_mode", False)
-                elif selected_id == "side_2" or selected_id == "tab_2": # Playlists / Library
-                    sys.stdout.write("\033[2J\033[H[i] 재생목록 불러오는 중...")
-                    sys.stdout.flush()
-                    try:
-                        new_data = fetch_youtube_playlists(max_results, cookies_file, cookies_from_browser)
-                        data["videos"] = new_data.get("videos", [])
-                        current_max_results = len(data["videos"])
-                        num_videos = current_max_results
-                        scroll_row = 0
-                        selected_id = "video_0"
-                    except Exception as e:
-                        print(f"\n[!] 재생목록 불러오기 실패: {e}")
-                        time.sleep(2)
-                    sys.stdout.write("\033[2J\033[H")
-                    sys.stdout.flush()
                 elif selected_id == "account":
                     if not logged_in:
                         if old_settings:
