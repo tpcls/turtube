@@ -2429,15 +2429,15 @@ def run_interactive(
                                     tty.setcbreak(fd)
                                 sys.stdout.write("\033[?25l\033[2J\033[H")
                                 sys.stdout.flush()
-        except Exception as e:
-            # Log error and exit safely
-            if old_settings:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-            sys.stdout.write("\033[?25h\033[2J\033[H")
-            print(f"[Fatal Error in Loop] {e}")
-            import traceback
-            traceback.print_exc()
-            sys.exit(1)
+    except Exception as e:
+        # Log error and exit safely
+        if old_settings:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        sys.stdout.write("\033[?25h\033[2J\033[H")
+        print(f"[Fatal Error in Loop] {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
     finally:
         # Restore terminal on exit
         if old_settings:
