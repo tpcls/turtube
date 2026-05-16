@@ -1,6 +1,0 @@
-#!/usr/bin/env bash
-# Extensionless launcher for the YouTube ASCII interface.
-set -euo pipefail
-
-PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-exec "$PROJECT_DIR/run_youtube_ascii.sh" "$@"
