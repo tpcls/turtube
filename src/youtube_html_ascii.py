@@ -1908,10 +1908,18 @@ def run_interactive(
 
     try:
         while True:
-            try:
+                # Dynamic resize detection
+                curr_w, curr_h = resolve_output_size(None, None)
+                if curr_w != width or curr_h != height:
+                    width, height = curr_w, curr_h
+                    need_redraw = True
+
                 if need_redraw:
                     # Move cursor to top
                     sys.stdout.write("\033[H")
+                    
+                    # Recalculate layout if resized
+                    sidebar_w, content_w, columns, visible_rows = calc_layout(width, height)
                     
                     # Use pre-calculated values
                     ascii_ui = render_home_interface(
