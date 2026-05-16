@@ -1594,10 +1594,18 @@ def render_home_interface(
             label = f"|-{name}" if not is_sel else name
             sidebar.append(side_item(label, f"sub_{i}", indent=1))
             
+    is_dl_mode = data.get("download_mode", False)
+    dl_label = "[●] Downloads" if is_dl_mode else "Downloads"
+    dl_item_line = side_item(dl_label, "side_3")
+    # Paint red if download mode active
+    if is_dl_mode and selected_id != "side_3":
+        dl_item_line = "|" + paint(fit("  " + dl_label, sidebar_w - 2), "red") + "|"
+    elif is_dl_mode and selected_id == "side_3":
+        dl_item_line = paint("|", "bright_black") + paint(fit("> " + dl_label, sidebar_w - 2), "red") + paint("|", "bright_black")
     sidebar.extend([
         side_item("History", "side_1"),
         side_item("Playlists", "side_2"),
-        side_item("Downloads", "side_3"),
+        dl_item_line,
         border(sidebar_w),
     ])
     all_lines = header + [merge_columns(sidebar, content_lines)]
@@ -2219,39 +2227,12 @@ def run_interactive(
                         time.sleep(2)
                     sys.stdout.write("\033[2J\033[H")
                     sys.stdout.flush()
-                elif selected_id == "side_3": # Downloads
-                    focused_video = data.get("last_video_focus")
-                    if focused_video:
-                        dl_url = focused_video.get("url", "")
-                        if dl_url.startswith("/"):
-                            dl_url = "https://www.youtube.com" + dl_url
-                        dl_dir = os.path.join(os.getcwd(), "downloads")
-                        os.makedirs(dl_dir, exist_ok=True)
-                        sys.stdout.write(f"\033[2J\033[H[↓] 다운로드 중: {focused_video.get('title', dl_url)}\n")
-                        sys.stdout.flush()
-                        if old_settings:
-                            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                        try:
-                            import subprocess as _sp
-                            _sp.run([
-                                sys.executable, "-m", "yt_dlp",
-                                "-o", os.path.join(dl_dir, "%(title)s.%(ext)s"),
-                                dl_url
-                            ])
-                            sys.stdout.write("\n[✓] 다운로드 완료!\n")
-                            sys.stdout.flush()
-                        except Exception as e:
-                            sys.stdout.write(f"\n[!] 다운로드 실패: {e}\n")
-                            sys.stdout.flush()
-                        time.sleep(2)
-                        if old_settings:
-                            tty.setcbreak(fd)
-                        sys.stdout.write("\033[?25l\033[2J\033[H")
-                        sys.stdout.flush()
-                    else:
-                        sys.stdout.write("\033[2J\033[H[!] 다운로드할 영상이 없습니다. 영상을 먼저 선택하세요.\n")
-                        sys.stdout.flush()
-                        time.sleep(2)
+                elif selected_id == "side_3": # Downloads mode toggle
+                    data["download_mode"] = not data.get("download_mode", False)
+                    mode_str = "ON (빨간색 활성화)" if data["download_mode"] else "OFF"
+                    sys.stdout.write(f"\033[2J\033[H[↓] 다운로드 모드 {mode_str}\n영상에서 엔터를 누르면 백그라운드에서 다운로드됩니다.\n")
+                    sys.stdout.flush()
+                    time.sleep(1)
                 elif selected_id == "side_2" or selected_id == "tab_2": # Playlists / Library
                     sys.stdout.write("\033[2J\033[H[i] 재생목록 불러오는 중...")
                     sys.stdout.flush()
@@ -2368,6 +2349,64 @@ def run_interactive(
                         if url:
                             if url.startswith("/"):
                                 url = "https://www.youtube.com" + url
+                            
+                            # ── Download Mode: background download + local playback ──
+                            dl_cache_file = os.path.join(os.getcwd(), "scratch", "download_cache.json")
+                            def _load_dl_cache():
+                                try:
+                                    with open(dl_cache_file, "r", encoding="utf-8") as _f:
+                                        return json.load(_f)
+                                except: return {}
+                            def _save_dl_cache(c):
+                                try:
+                                    with open(dl_cache_file, "w", encoding="utf-8") as _f:
+                                        json.dump(c, _f, ensure_ascii=False, indent=2)
+                                except: pass
+
+                            vid_key = video.get("id") or video.get("videoId") or url
+                            dl_cache = _load_dl_cache()
+                            local_path = dl_cache.get(vid_key)
+
+                            # If download mode ON and no local file yet → background download
+                            if data.get("download_mode") and not (local_path and os.path.exists(local_path)):
+                                dl_dir = os.path.join(os.getcwd(), "downloads")
+                                os.makedirs(dl_dir, exist_ok=True)
+                                def _bg_download(u=url, vk=vid_key, title=video.get("title","video")):
+                                    try:
+                                        import subprocess as _sp
+                                        out_tmpl = os.path.join(dl_dir, "%(title)s.%(ext)s")
+                                        r = _sp.run(
+                                            [sys.executable, "-m", "yt_dlp", "--print", "after_move:filepath",
+                                             "-o", out_tmpl, u],
+                                            capture_output=True, text=True
+                                        )
+                                        fpath = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+                                        if fpath and os.path.exists(fpath):
+                                            c = _load_dl_cache()
+                                            c[vk] = fpath
+                                            _save_dl_cache(c)
+                                    except: pass
+                                threading.Thread(target=_bg_download, daemon=True).start()
+                                sys.stdout.write(f"\n[↓] 백그라운드 다운로드 시작: {video.get('title','video')}\n")
+                                sys.stdout.flush()
+                                time.sleep(0.8)
+
+                            # If local file exists → play with ffplay directly
+                            if local_path and os.path.exists(local_path):
+                                if old_settings:
+                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                                ffplay_path = os.path.join(os.getcwd(), "ffplay.exe") if os.name == "nt" else "ffplay"
+                                sys.stdout.write(f"\033[?25h\033[2J\033[H[▶] 로컬 파일 재생: {local_path}\n")
+                                sys.stdout.flush()
+                                try:
+                                    subprocess.run([ffplay_path, "-autoexit", local_path])
+                                except Exception as e:
+                                    sys.stdout.write(f"[!] 로컬 재생 실패: {e}\n")
+                                if old_settings:
+                                    tty.setcbreak(fd)
+                                sys.stdout.write("\033[?25l\033[2J\033[H")
+                                sys.stdout.flush()
+                                continue  # skip normal streaming playback
                             
                             # Restore terminal for subprocess
                             if old_settings:
