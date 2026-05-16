@@ -1044,46 +1044,49 @@ class AsciiVideoPipeline:
                 break
 
     def _producer(self, cap: cv2.VideoCapture, fps_target: float):
-        """별도 스레드에서 프레임을 미리 ASCII로 변환해 버퍼링.
-           재생 시작 시점(t_start)이 설정되면 그에 맞춰 프레임을 스킵함."""
+        """별도 스레드에서 프레임을 미리 ASCII로 변환해 버퍼링."""
         frame_idx = 0
-        while not self._stop.is_set():
-            # [동적 스킵] 재생이 시작되었고 변환 속도가 뒤처지면 입력 단계에서 스킵
-            if getattr(self, "t_start", None) is not None:
-                elapsed = time.perf_counter() - self.t_start
-                expected_idx = int(elapsed * fps_target)
-                if frame_idx < expected_idx:
-                    skip_count = expected_idx - frame_idx
-                    for _ in range(skip_count):
-                        if not cap.grab():
-                            break
-                    frame_idx = expected_idx
-
-            ret, frame = cap.read()
-            if not ret:
-                try:
-                    self._q.put(None, timeout=1)
-                except queue.Full:
-                    pass
-                break
-
-            ascii_str = self.conv.convert_frame(frame)
-            frame_idx += 1
-            out_lines = ascii_str.count("\n") + 1
-            payload = (ascii_str, out_lines, self.conv.width, out_lines)
-
+        try:
             while not self._stop.is_set():
-                try:
-                    # 큐가 꽉 찼을 때 너무 오래 대기하지 않음 (스킵 기회 확보)
-                    if self._q.put(payload, timeout=0.05):
-                        break
-                except queue.Full:
-                    self._render_blocked += 1
-                    # 만약 재생 중이라면 큐가 빌 때까지 기다리지 않고 다음 프레임 시도로 넘어감 (스킵 유도)
-                    if getattr(self, "t_start", None) is not None:
-                        break
-                    continue
-                break
+                # [동적 스킵] 재생이 시작되었고 변환 속도가 뒤처지면 입력 단계에서 스킵
+                if getattr(self, "t_start", None) is not None:
+                    elapsed = time.perf_counter() - self.t_start
+                    expected_idx = int(elapsed * fps_target)
+                    if frame_idx < expected_idx:
+                        skip_count = expected_idx - frame_idx
+                        for _ in range(skip_count):
+                            if not cap.grab():
+                                break
+                        frame_idx = expected_idx
+
+                ret, frame = cap.read()
+                if not ret:
+                    if frame_idx == 0:
+                        print("\n[!] 첫 프레임을 읽지 못했습니다. (비디오 스트림 오류)")
+                    try:
+                        self._q.put(None, timeout=1)
+                    except: pass
+                    break
+
+                ascii_str = self.conv.convert_frame(frame)
+                frame_idx += 1
+                out_lines = ascii_str.count("\n") + 1
+                payload = (ascii_str, out_lines, self.conv.width, out_lines)
+
+                while not self._stop.is_set():
+                    try:
+                        if self._q.put(payload, timeout=0.1):
+                            break
+                    except queue.Full:
+                        if getattr(self, "t_start", None) is not None:
+                            break
+                        continue
+                    break
+        except Exception as e:
+            print(f"\n[!] 렌더링 스레드 오류: {e}")
+            try:
+                self._q.put(None, timeout=1)
+            except: pass
 
     def _visual_len(self, s):
         """ANSI 코드를 제외한 문자열의 실제 출력 너비 계산 (한글 2칸 고려)"""
@@ -1130,12 +1133,56 @@ class AsciiVideoPipeline:
     def run_terminal(self, source, fps_target: float = 30.0,
                      hide_cursor: bool = True, loop: bool = False, 
                      suggestions: list = None, audio_url: str = None):
-        """실시간 터미널 출력 (터미널 리사이즈 자동 대응)"""
+        """실시간 터미널 출력 (사이드바 상호작용 추가)"""
         if hide_cursor:
             self._set_cursor_visible(False)
             
         webcam = isinstance(source, int)
         frame_delay = 1.0 / fps_target
+
+        # 상호작용 상태
+        focus_sidebar = False
+        selected_sidebar_idx = 0
+        sidebar_len = len(suggestions) if suggestions else 0
+
+        # 키보드 입력 설정 (Non-blocking)
+        old_settings = None
+        if platform.system() != "Windows":
+            import tty, termios
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            tty.setcbreak(fd)
+
+        def get_key():
+            if platform.system() == "Windows":
+                import msvcrt
+                if msvcrt.kbhit():
+                    ch = msvcrt.getch()
+                    if ch in (b'\x00', b'\xe0'): # 특수키
+                        ch2 = msvcrt.getch()
+                        if ch2 == b'H': return "up"
+                        if ch2 == b'P': return "down"
+                        if ch2 == b'M': return "right"
+                        if ch2 == b'K': return "left"
+                    if ch == b'\r': return "enter"
+                    if ch == b'\t': return "tab"
+                    if ch == b'q': return "quit"
+                    return ch.decode('ascii', errors='ignore')
+            else:
+                import select
+                if select.select([sys.stdin], [], [], 0)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch == '\x1b':
+                        res = sys.stdin.read(2)
+                        if res == '[A': return "up"
+                        if res == '[B': return "down"
+                        if res == '[C': return "right"
+                        if res == '[D': return "left"
+                    if ch == '\n': return "enter"
+                    if ch == '\t': return "tab"
+                    if ch == 'q': return "quit"
+                    return ch
+            return None
 
         while True:
             # 윈도우 환경에서 FFmpeg 안정성을 위해 속성 직접 지정
@@ -1182,16 +1229,21 @@ class AsciiVideoPipeline:
             
             audio_proc = None
             if audio_url:
-                try:
-                    cmd = ["ffplay", "-nodisp", "-autoexit", "-vn", "-loglevel", "quiet", audio_url]
-                    startupinfo = None
-                    if platform.system() == "Windows":
-                        startupinfo = subprocess.STARTUPINFO()
-                        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-                        startupinfo.wShowWindow = 0 
-                    audio_proc = subprocess.Popen(cmd, startupinfo=startupinfo)
-                except Exception:
-                    pass
+                if not shutil.which("ffplay"):
+                    print("\n[!] 경고: ffplay를 찾을 수 없습니다. 소리를 재생하려면 FFmpeg를 설치해 주세요.")
+                    time.sleep(2)
+                else:
+                    try:
+                        cmd = ["ffplay", "-nodisp", "-autoexit", "-vn", "-loglevel", "quiet", audio_url]
+                        startupinfo = None
+                        if platform.system() == "Windows":
+                            startupinfo = subprocess.STARTUPINFO()
+                            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                            startupinfo.wShowWindow = 0 
+                        audio_proc = subprocess.Popen(cmd, startupinfo=startupinfo)
+                    except Exception as e:
+                        print(f"\n[!] 오디오 재생 오류: {e}")
+                        time.sleep(1)
 
             if hide_cursor:
                 sys.stdout.write("\x1b[?25l")
@@ -1204,6 +1256,35 @@ class AsciiVideoPipeline:
                 fps_display = fps_target
                 
                 while True:
+                    # 0. 키보드 입력 처리 (Non-blocking)
+                    key = get_key()
+                    if key == "quit":
+                        self._stop.set()
+                        break
+                    elif key in ("tab", "right") and not focus_sidebar and sidebar_len > 0:
+                        focus_sidebar = True
+                        self._sidebar_cache = None # 레드라이 유도
+                    elif key in ("tab", "left") and focus_sidebar:
+                        focus_sidebar = False
+                        self._sidebar_cache = None
+                    elif focus_sidebar:
+                        if key == "up":
+                            selected_sidebar_idx = (selected_sidebar_idx - 1) % min(6, sidebar_len)
+                            self._sidebar_cache = None
+                        elif key == "down":
+                            selected_sidebar_idx = (selected_sidebar_idx + 1) % min(6, sidebar_len)
+                            self._sidebar_cache = None
+                        elif key == "enter":
+                            # 추천 영상 재생 요청
+                            if 0 <= selected_sidebar_idx < sidebar_len:
+                                target_vid = suggestions[selected_sidebar_idx]
+                                self._stop.set()
+                                if audio_proc: audio_proc.terminate()
+                                if old_settings: 
+                                    import termios
+                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                                # 100 + 인덱스 코드로 종료하여 부모 프로세스에 알림
+                                sys.exit(100 + selected_sidebar_idx)
                     # 1. 동기화: 현재 시각에 출력되어야 할 '목표 프레임 번호' 계산
                     now = time.perf_counter()
                     
@@ -1246,20 +1327,19 @@ class AsciiVideoPipeline:
 
                     ascii_str, out_lines, frame_w, frame_h = item
                     
-                    # 4. 터미널 리사이즈 및 출력 (기존 로직 유지하되 최적화)
-                    if frame_count % 15 == 0:
-                        cur_term_size = get_terminal_size()
-                        if cur_term_size != prev_term_size:
-                            sys.stdout.write("\x1b[2J\x1b[H")
-                            prev_term_size = cur_term_size
-                            self._drain_render_queue()
-                    else:
-                        cur_term_size = prev_term_size
+                    # 4. 터미널 리사이즈 및 출력
+                    cur_term_size = get_terminal_size()
+                    if cur_term_size != prev_term_size:
+                        sys.stdout.write("\x1b[2J\x1b[H")
+                        prev_term_size = cur_term_size
+                        self._drain_render_queue()
 
                     # 출력 스트링 조립
                     cols, rows = cur_term_size
+                    mode_text = "추천영상 선택" if focus_sidebar else "영상 재생"
                     status = (
-                        f" FPS:{fps_display:4.1f} | "
+                        f" [{mode_text}] | "
+                        f"FPS:{fps_display:4.1f} | "
                         f"프레임:{frame_count}" + (f"/{total}" if total > 0 else "") +
                         f" | {frame_w}x{frame_h} | {BACKEND.upper()}"
                     )
@@ -1269,23 +1349,27 @@ class AsciiVideoPipeline:
                     max_rows = rows - 2
                     v_lines = ascii_str.splitlines()[:max_rows]
                     
-                    # atomic write: 전체 화면을 한 번에 업데이트 (깜빡임 최소화)
+                    # 1. 메인 영상 출력 (줄바꿈 포함)
                     output = ["\x1b[H"]
-                    output.extend([line + "\x1b[K" for line in v_lines])
+                    for line in v_lines:
+                        # 영상 너비가 터미널보다 좁을 경우 배경을 지우며 출력
+                        output.append(line + "\x1b[K\n")
                     
-                    # 사이드바 (추천 영상) 처리 로직 (생략된 경우 통합)
-                    if (suggestions is not None) and cols >= 110:
-                        sidebar_w = min(50, cols - frame_w - 8)
+                    # 2. 사이드바 (추천 영상) 출력 - 절대 좌표 사용
+                    if (suggestions is not None) and cols > (frame_w + 20):
+                        sidebar_w = min(60, cols - frame_w - 6)
                         if sidebar_w > 15:
-                            # 사이드바 캐시 렌더링...
-                            if not hasattr(self, '_sidebar_cache') or self._sidebar_cache_w != sidebar_w:
-                                self._sidebar_cache = self._render_sidebar_lines(suggestions, sidebar_w)
+                            if not hasattr(self, '_sidebar_cache') or self._sidebar_cache is None or self._sidebar_cache_w != sidebar_w:
+                                self._sidebar_cache = self._render_sidebar_lines(
+                                    suggestions, sidebar_w,
+                                    highlight_idx=selected_sidebar_idx if focus_sidebar else -1
+                                )
                                 self._sidebar_cache_w = sidebar_w
                             
                             s_lines = self._sidebar_cache
                             for i, sl in enumerate(s_lines[:len(v_lines)]):
-                                # ANSI 이스케이프: i+1행, frame_w+4열로 이동
-                                output.append(f"\x1b[{i+1};{frame_w+4}H{sl}")
+                                # 영상 옆 공간으로 점프하여 출력
+                                output.append(f"\x1b[{i+1};{frame_w+3}H{sl}")
 
                     # 상태바 추가
                     status_y = len(v_lines) + 1
@@ -1333,7 +1417,7 @@ class AsciiVideoPipeline:
             if not loop or webcam:
                 break
 
-    def _render_sidebar_lines(self, suggestions, width):
+    def _render_sidebar_lines(self, suggestions, width, highlight_idx=-1):
         """추천 영상 목록을 ASCII 줄 리스트로 변환 (작은 컬러 섬네일 포함)"""
         lines = []
         if not suggestions or width < 30: return lines
@@ -1402,10 +1486,13 @@ class AsciiVideoPipeline:
             if curr: t_rows.append(curr)
             
             # 1~3행: 섬네일 + 제목
+            is_selected = (idx == highlight_idx)
+            border_color = "\x1b[92;1m" if is_selected else "\x1b[97m"
+            
             for i in range(3):
                 row_text = t_rows[i] if i < len(t_rows) else ""
                 content = self._visual_ljust(row_text, width - thumb_w - 6)
-                lines.append(finalize_line(f"\x1b[97m| {t_ascii[i]}  {content} |\x1b[0m"))
+                lines.append(finalize_line(f"{border_color}| \x1b[0m{t_ascii[i]}  {content} {border_color}|\x1b[0m"))
             
             # 4행: 섬네일 + 채널 & 길이
             c_clean = _re.sub(r'\x1b\[[0-9;]*m', '', channel)
@@ -1415,13 +1502,13 @@ class AsciiVideoPipeline:
             else:
                 info_text = c_clean
             c_content = self._visual_ljust(info_text, width - thumb_w - 6)
-            lines.append(finalize_line(f"\x1b[97m| {t_ascii[3]}  \x1b[36m{c_content}\x1b[0m |\x1b[0m"))
+            lines.append(finalize_line(f"{border_color}| \x1b[0m{t_ascii[3]}  \x1b[36m{c_content}\x1b[0m {border_color}|\x1b[0m"))
             
             # 5행: 섬네일 나머지
             empty_space = self._visual_ljust("", width - thumb_w - 6)
-            lines.append(finalize_line(f"\x1b[97m| {t_ascii[4]}  {empty_space} |\x1b[0m"))
+            lines.append(finalize_line(f"{border_color}| \x1b[0m{t_ascii[4]}  {empty_space} {border_color}|\x1b[0m"))
                 
-            lines.append(finalize_line("\x1b[97m|" + " " * (width - 2) + "|\x1b[0m"))
+            lines.append(finalize_line(f"{border_color}|" + ("=" if is_selected else " ") * (width - 2) + f"|\x1b[0m"))
             
         lines.append(border)
         return lines
@@ -1696,6 +1783,12 @@ class YtDlpSource:
             over = [f for f in fmts if f.get("vcodec","none") != "none" and f.get("url")]
             best = min(over, key=lambda f: f.get("height", 9999)) if over else None
 
+        if not best:
+            # 진짜 아무것도 없으면 그냥 첫 번째 URL이 있는 포맷이라도 잡음
+            any_with_url = [f for f in fmts if f.get("url")]
+            if any_with_url:
+                best = any_with_url[0]
+
         if best and best.get("url"):
             h = best.get("height", "?")
             w = best.get("width", "?")
@@ -1706,7 +1799,12 @@ class YtDlpSource:
         if info.get("url"):
             return info["url"]
 
-        raise RuntimeError("재생 가능한 스트림 URL을 찾지 못했습니다.")
+        # 디버깅용 정보 출력
+        print(f"[!] 디버그: 발견된 포맷 수 = {len(fmts)}")
+        if fmts:
+            print(f"    첫 번째 포맷 예시: {fmts[0].get('format_id')} (vcodec: {fmts[0].get('vcodec')}, url: {'있음' if fmts[0].get('url') else '없음'})")
+
+        raise RuntimeError("재생 가능한 스트림 URL을 찾지 못했습니다. (yt-dlp가 직접 URL을 반환하지 않음)")
     def get_audio_url(self, info: dict = None) -> str:
         """
         오디오 전용 스트림 URL 반환 (ffplay 재생용).
@@ -1941,15 +2039,15 @@ def main():
                 import json
                 s_list = json.loads(args.suggestions)
                 if s_list and cols > 120:
-                    conv.width = cols - 70
+                    conv.width = cols - 72 # 마진 추가
                 elif s_list and cols > 90:
-                    conv.width = cols - 50
+                    conv.width = cols - 52 # 마진 추가
                 else:
-                    conv.width = cols
+                    conv.width = cols - 2 # 기본 마진
             except:
-                conv.width = cols
+                conv.width = cols - 2
         else:
-            conv.width = cols
+            conv.width = cols - 2
 
         print(f"[✓] 자동 해상도 모드: 터미널 {cols}×{rows} 에 맞춤 (영상 너비: {conv.width})")
     

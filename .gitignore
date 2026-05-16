@@ -1,22 +1,43 @@
-.DS_Store
-.env
-.env.*
-!.env.example
-
-node_modules/
-npm-debug.log*
-
-venv/
-venv_*/
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*$py.class
 
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
 build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Windows 빌드 아티팩트
-*.obj
-*.pdb
-*.exp
-*.lib
-*.ilk
-Thumbs.db
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Project specific
+scratch/
+cookies.txt
+*.log
+*.tmp
+.DS_Store

@@ -9,5 +9,5 @@ if not exist "%SCRIPT_DIR%venv_ascii\Scripts\activate.bat" (
     exit /b 1
 )
 call "%SCRIPT_DIR%venv_ascii\Scripts\activate.bat"
-python "%SCRIPT_DIR%src\youtube_html_ascii.py" %* <nul
+python "%SCRIPT_DIR%src\youtube_html_ascii.py" %*
 endlocal
