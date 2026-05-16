@@ -19,7 +19,6 @@ if not exist "venv_ascii" (
     python -m venv venv_ascii
 )
 
-echo [i] 가상환경 활성화 및 라이브러리 업데이트...
 call venv_ascii\Scripts\activate.bat
 python -m pip install --upgrade pip
 if exist "requirements.txt" (
@@ -43,7 +42,6 @@ if exist "package.json" (
 )
 
 REM 4. 터튜브 실행
-echo [i] 터튜브 Turtube 를 시작합니다...
 python src\youtube_html_ascii.py --interactive
 
 deactivate
