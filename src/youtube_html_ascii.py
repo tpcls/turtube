@@ -1998,6 +1998,11 @@ def run_interactive(
                     idx = int(selected_id.split("_")[1])
                     num_videos = len(data.get("videos", []))
                     
+                    # Track last focused video for Downloads
+                    _vids = data.get("videos", [])
+                    if 0 <= idx < len(_vids):
+                        data["last_video_focus"] = _vids[idx]
+                    
                     if is_down: # Down
                         if idx + current_columns < num_videos:
                             new_idx = idx + current_columns
@@ -2062,7 +2067,7 @@ def run_interactive(
                             if idx < len(subs) - 1: selected_id = f"sub_{idx + 1}"
                             else: selected_id = "side_1"
                         else:
-                            if idx < 3: selected_id = f"side_{idx + 1}"
+                            if idx < 4: selected_id = f"side_{idx + 1}"
                     elif is_right:
                         # Re-calculate columns for dynamic grid entry
                         _, _, current_cols, _ = calc_layout(width, height)
@@ -2214,6 +2219,39 @@ def run_interactive(
                         time.sleep(2)
                     sys.stdout.write("\033[2J\033[H")
                     sys.stdout.flush()
+                elif selected_id == "side_3": # Downloads
+                    focused_video = data.get("last_video_focus")
+                    if focused_video:
+                        dl_url = focused_video.get("url", "")
+                        if dl_url.startswith("/"):
+                            dl_url = "https://www.youtube.com" + dl_url
+                        dl_dir = os.path.join(os.getcwd(), "downloads")
+                        os.makedirs(dl_dir, exist_ok=True)
+                        sys.stdout.write(f"\033[2J\033[H[↓] 다운로드 중: {focused_video.get('title', dl_url)}\n")
+                        sys.stdout.flush()
+                        if old_settings:
+                            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                        try:
+                            import subprocess as _sp
+                            _sp.run([
+                                sys.executable, "-m", "yt_dlp",
+                                "-o", os.path.join(dl_dir, "%(title)s.%(ext)s"),
+                                dl_url
+                            ])
+                            sys.stdout.write("\n[✓] 다운로드 완료!\n")
+                            sys.stdout.flush()
+                        except Exception as e:
+                            sys.stdout.write(f"\n[!] 다운로드 실패: {e}\n")
+                            sys.stdout.flush()
+                        time.sleep(2)
+                        if old_settings:
+                            tty.setcbreak(fd)
+                        sys.stdout.write("\033[?25l\033[2J\033[H")
+                        sys.stdout.flush()
+                    else:
+                        sys.stdout.write("\033[2J\033[H[!] 다운로드할 영상이 없습니다. 영상을 먼저 선택하세요.\n")
+                        sys.stdout.flush()
+                        time.sleep(2)
                 elif selected_id == "side_2" or selected_id == "tab_2": # Playlists / Library
                     sys.stdout.write("\033[2J\033[H[i] 재생목록 불러오는 중...")
                     sys.stdout.flush()
