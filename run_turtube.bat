@@ -1,5 +1,6 @@
 @echo off
 setlocal enabledelayedexpansion
+chcp 65001 > nul
 
 echo [i] Turtube 통합 설치 및 실행 도우미
 echo ========================================
@@ -14,7 +15,7 @@ if not exist "ffplay.exe" (
 
 REM 2. Python 가상환경 설정
 if not exist "venv_ascii" (
-    echo [i] 가상환경(venv_ascii) 생성 중...
+    echo [i] 가상환경 venv_ascii 생성 중...
     python -m venv venv_ascii
 )
 
@@ -30,13 +31,13 @@ python -m playwright install chromium
 
 REM 3. API 서버 실행 (Node.js)
 if exist "package.json" (
-    echo [i] API 서버(npm start) 실행 중...
+    echo [i] API 서버 npm start 실행 중...
     start /b npm start
     timeout /t 5 > nul
 )
 
 REM 4. 터튜브 실행
-echo [i] 터튜브(Turtube)를 시작합니다...
+echo [i] 터튜브 Turtube 를 시작합니다...
 python src\youtube_html_ascii.py --interactive
 
 deactivate
