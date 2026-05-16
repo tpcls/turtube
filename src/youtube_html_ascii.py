@@ -1944,253 +1944,232 @@ def run_interactive(
             if key is None:
                 time.sleep(0.01)
                 continue
+            
+            need_redraw = True
+            
+            # Use 'q' or 'esc' as exit keys
+            if key == b'esc' or key.lower() == b'q':
+                break
+
+            if key in (b'j', b'J'):
+                key = b'down'
+            elif key in (b'k', b'K'):
+                key = b'up'
+            elif key in (b' ', b'f', b'F'):
+                key = b'pagedown'
+            elif key in (b'b', b'B'):
+                key = b'pageup'
+            elif key in (b'g',):
+                key = b'home'
+            elif key in (b'G',):
+                key = b'end'
+
+            if key == b'pagedown':
+                scroll_page(visible_rows)
+                continue
+            if key == b'pageup':
+                scroll_page(-visible_rows)
+                continue
+            if key == b'home':
+                scroll_row = 0
+                if data.get("videos"):
+                    selected_id = "video_0"
+                continue
+            if key == b'end':
+                scroll_row = max_scroll_row()
+                videos = data.get("videos", [])
+                if videos:
+                    selected_id = f"video_{len(videos) - 1}"
+                    clamp_selection_to_scroll()
+                continue
+            
+            # Handle arrows
+            is_up = (key == b'up')
+            is_down = (key == b'down')
+            is_left = (key == b'left')
+            is_right = (key == b'right')
+
+            # Use dynamic columns for scrolling
+            is_channel_list = data.get("type") == "channel_list"
+            current_columns = 2 if is_channel_list else columns
+
+            if is_up or is_down or is_left or is_right:
+                if selected_id.startswith("video_"):
+                    idx = int(selected_id.split("_")[1])
+                    num_videos = len(data.get("videos", []))
                     
-                need_redraw = True
-                
-                # Use 'q' or 'esc' as exit keys
-                if key == b'esc' or key.lower() == b'q':
-                    break
+                    if is_down: # Down
+                        if idx + current_columns < num_videos:
+                            new_idx = idx + current_columns
+                            selected_id = f"video_{new_idx}"
+                            row = new_idx // current_columns
+                            if row >= scroll_row + visible_rows:
+                                scroll_row = row - visible_rows + 1
+                    elif is_up: # Up
+                        if idx >= current_columns:
+                            new_idx = idx - current_columns
+                            selected_id = f"video_{new_idx}"
+                            row = new_idx // current_columns
+                            if row < scroll_row:
+                                scroll_row = row
+                        else:
+                            # Row 0 videos move up to search
+                            selected_id = "search"
+                    elif is_left: # Left
+                        if idx % current_columns == 0 and sidebar_w > 0:
+                            # Move to sidebar
+                            selected_id = f"side_{min(3, idx // current_columns)}"
+                        elif idx > 0:
+                            new_idx = idx - 1
+                            selected_id = f"video_{new_idx}"
+                            if (new_idx // columns) < scroll_row:
+                                scroll_row = max(0, (new_idx // columns))
+                    elif is_right: # Right
+                        if idx < num_videos - 1:
+                            new_idx = idx + 1
+                            selected_id = f"video_{new_idx}"
+                            if (new_idx // columns) >= scroll_row + visible_rows:
+                                scroll_row = (new_idx // columns) - visible_rows + 1
 
-                if key in (b'j', b'J'):
-                    key = b'down'
-                elif key in (b'k', b'K'):
-                    key = b'up'
-                elif key in (b' ', b'f', b'F'):
-                    key = b'pagedown'
-                elif key in (b'b', b'B'):
-                    key = b'pageup'
-                elif key in (b'g',):
-                    key = b'home'
-                elif key in (b'G',):
-                    key = b'end'
-
-                if key == b'pagedown':
-                    scroll_page(visible_rows)
-                    continue
-                if key == b'pageup':
-                    scroll_page(-visible_rows)
-                    continue
-                if key == b'home':
-                    scroll_row = 0
-                    if data.get("videos"):
+                    # Proactive Load More in Background
+                    if query and api_base and current_max_results < 100 and not is_fetching:
+                        if (is_down or is_right) and (idx >= num_videos - 3):
+                            is_fetching = True
+                            threading.Thread(target=fetch_more_bg, daemon=True).start()
+                            
+                elif selected_id.startswith("side_") or selected_id.startswith("sub_"):
+                    idx = int(selected_id.split("_")[1])
+                    if is_up:
+                        if selected_id.startswith("sub_"):
+                            if idx > 0: selected_id = f"sub_{idx - 1}"
+                            else: selected_id = "side_0"
+                        else:
+                            if idx > 0:
+                                if idx == 1 and data.get("subs_expanded"):
+                                    subs = data.get("subscriptions_list", [])
+                                    if subs: selected_id = f"sub_{len(subs) - 1}"
+                                    else: selected_id = "side_0"
+                                else:
+                                    selected_id = f"side_{idx - 1}"
+                            elif idx == 0: selected_id = "logo"
+                    elif is_down:
+                        if selected_id == "side_0" and data.get("subs_expanded"):
+                            subs = data.get("subscriptions_list", [])
+                            if subs: selected_id = "sub_0"
+                            else: selected_id = "side_1"
+                        elif selected_id.startswith("sub_"):
+                            subs = data.get("subscriptions_list", [])
+                            if idx < len(subs) - 1: selected_id = f"sub_{idx + 1}"
+                            else: selected_id = "side_1"
+                        else:
+                            if idx < 3: selected_id = f"side_{idx + 1}"
+                    elif is_right:
+                        # Re-calculate columns for dynamic grid entry
+                        _, _, current_cols, _ = calc_layout(width, height)
+                        selected_id = f"video_{scroll_row * current_cols}"
+                        
+                elif selected_id == "search":
+                    if is_down: # Down
+                        selected_id = "side_0" if sidebar_w > 0 else "video_0"
+                    elif is_right:
+                        selected_id = "account"
+                    elif is_left:
+                        selected_id = "logo"
+                        
+                elif selected_id == "logo":
+                    if is_down:
+                        selected_id = "side_0" if sidebar_w > 0 else "video_0"
+                    elif is_right:
+                        selected_id = "search"
+                        
+                elif selected_id == "account":
+                    if is_left:
+                        selected_id = "search"
+                    elif is_down:
+                        selected_id = "video_2"
+                    elif is_up:
+                        selected_id = "logo"
+                    
+                    # Reset logout confirm if moving away from account
+                    if data.get("logout_confirm"):
+                        data["logout_confirm"] = False
+            
+            # Global check: if focus moved away from account, reset logout_confirm
+            if selected_id != "account" and data.get("logout_confirm"):
+                data["logout_confirm"] = False
+            
+            elif key == b'enter': # Enter
+                if selected_id == "logo" or selected_id == "tab_0": # YouTube Logo = Home Refresh
+                    if data.get("home_cache"):
+                        # Use cache immediately
+                        data["videos"] = data["home_cache"]
+                        data["type"] = "video_list"
+                        num_videos = len(data["videos"])
+                        scroll_row = 0
                         selected_id = "video_0"
-                    continue
-                if key == b'end':
-                    scroll_row = max_scroll_row()
-                    videos = data.get("videos", [])
-                    if videos:
-                        selected_id = f"video_{len(videos) - 1}"
-                        clamp_selection_to_scroll()
-                    continue
-                
-                # Handle arrows
-                is_up = (key == b'up')
-                is_down = (key == b'down')
-                is_left = (key == b'left')
-                is_right = (key == b'right')
-
-                # Use dynamic columns for scrolling
-                is_channel_list = data.get("type") == "channel_list"
-                current_columns = 2 if is_channel_list else columns
-
-                if is_up or is_down or is_left or is_right:
-                    if selected_id.startswith("video_"):
-                        idx = int(selected_id.split("_")[1])
-                        num_videos = len(data.get("videos", []))
-                        
-                        if is_down: # Down
-                            if idx + current_columns < num_videos:
-                                new_idx = idx + current_columns
-                                selected_id = f"video_{new_idx}"
-                                row = new_idx // current_columns
-                                if row >= scroll_row + visible_rows:
-                                    scroll_row = row - visible_rows + 1
-                        elif is_up: # Up
-                            if idx >= current_columns:
-                                new_idx = idx - current_columns
-                                selected_id = f"video_{new_idx}"
-                                row = new_idx // current_columns
-                                if row < scroll_row:
-                                    scroll_row = row
-                            else:
-                                # Row 0 videos move up to search
-                                selected_id = "search"
-                        elif is_left: # Left
-                            if idx % current_columns == 0 and sidebar_w > 0:
-                                # Move to sidebar
-                                selected_id = f"side_{min(3, idx // current_columns)}"
-                            elif idx > 0:
-                                new_idx = idx - 1
-                                selected_id = f"video_{new_idx}"
-                                if (new_idx // columns) < scroll_row:
-                                    scroll_row = max(0, (new_idx // columns))
-                        elif is_right: # Right
-                            if idx < num_videos - 1:
-                                new_idx = idx + 1
-                                selected_id = f"video_{new_idx}"
-                                if (new_idx // columns) >= scroll_row + visible_rows:
-                                    scroll_row = (new_idx // columns) - visible_rows + 1
-
-                        # Proactive Load More in Background
-                        if query and api_base and current_max_results < 100 and not is_fetching:
-                            if (is_down or is_right) and (idx >= num_videos - 3):
-                                is_fetching = True
-                                threading.Thread(target=fetch_more_bg, daemon=True).start()
-                                
-                    elif selected_id.startswith("side_") or selected_id.startswith("sub_"):
-                        idx = int(selected_id.split("_")[1])
-                        if is_up:
-                            if selected_id.startswith("sub_"):
-                                if idx > 0: selected_id = f"sub_{idx - 1}"
-                                else: selected_id = "side_0"
-                            else:
-                                if idx > 0:
-                                    if idx == 1 and data.get("subs_expanded"):
-                                        subs = data.get("subscriptions_list", [])
-                                        if subs: selected_id = f"sub_{len(subs) - 1}"
-                                        else: selected_id = "side_0"
-                                    else:
-                                        selected_id = f"side_{idx - 1}"
-                                elif idx == 0: selected_id = "logo"
-                        elif is_down:
-                            if selected_id == "side_0" and data.get("subs_expanded"):
-                                subs = data.get("subscriptions_list", [])
-                                if subs: selected_id = "sub_0"
-                                else: selected_id = "side_1"
-                            elif selected_id.startswith("sub_"):
-                                subs = data.get("subscriptions_list", [])
-                                if idx < len(subs) - 1: selected_id = f"sub_{idx + 1}"
-                                else: selected_id = "side_1"
-                            else:
-                                if idx < 3: selected_id = f"side_{idx + 1}"
-                        elif is_right:
-                            # Re-calculate columns for dynamic grid entry
-                            _, _, current_cols, _ = calc_layout(width, height)
-                            selected_id = f"video_{scroll_row * current_cols}"
-                            
-                    elif selected_id == "search":
-                        if is_down: # Down
-                            selected_id = "side_0" if sidebar_w > 0 else "video_0"
-                        elif is_right:
-                            selected_id = "account"
-                        elif is_left:
-                            selected_id = "logo"
-                            
-                    elif selected_id == "logo":
-                        if is_down:
-                            selected_id = "side_0" if sidebar_w > 0 else "video_0"
-                        elif is_right:
-                            selected_id = "search"
-                            
-                    elif selected_id == "account":
-                        if is_left:
-                            selected_id = "search"
-                        elif is_down:
-                            selected_id = "video_2"
-                        elif is_up:
-                            selected_id = "logo"
-                        
-                        # Reset logout confirm if moving away from account
-                        if data.get("logout_confirm"):
-                            data["logout_confirm"] = False
-                
-                # Global check: if focus moved away from account, reset logout_confirm
-                if selected_id != "account" and data.get("logout_confirm"):
-                    data["logout_confirm"] = False
-                
-                elif key == b'enter': # Enter
-                    if selected_id == "logo" or selected_id == "tab_0": # YouTube Logo = Home Refresh
-                        if data.get("home_cache"):
-                            # Use cache immediately
-                            data["videos"] = data["home_cache"]
+                        # Refresh cache in background for next time
+                        def refresh_home():
+                            try:
+                                res = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
+                                data["home_cache"] = res.get("videos", [])
+                            except: pass
+                        threading.Thread(target=refresh_home, daemon=True).start()
+                    else:
+                        sys.stdout.write("\033[2J\033[H[i] 추천 영상 불러오는 중...")
+                        sys.stdout.flush()
+                        try:
+                            new_data = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
+                            data["videos"] = new_data.get("videos", [])
+                            data["home_cache"] = data["videos"]
                             data["type"] = "video_list"
                             num_videos = len(data["videos"])
                             scroll_row = 0
                             selected_id = "video_0"
-                            # Refresh cache in background for next time
-                            def refresh_home():
+                        except Exception as e:
+                            print(f"\n[!] 새로고침 실패: {e}")
+                            time.sleep(1)
+                        sys.stdout.write("\033[2J\033[H")
+                        sys.stdout.flush()
+                elif selected_id == "side_0": # Subscriptions toggle
+                    if not data.get("subs_expanded"):
+                        if data.get("subscriptions_list"):
+                            # Use cached list immediately
+                            data["subs_expanded"] = True
+                            # Refresh in background for next time
+                            def refresh_subs():
                                 try:
-                                    res = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
-                                    data["home_cache"] = res.get("videos", [])
+                                    res = fetch_youtube_channel_list(max_results, cookies_file, cookies_from_browser)
+                                    data["subscriptions_list"] = res.get("videos", [])
                                 except: pass
-                            threading.Thread(target=refresh_home, daemon=True).start()
+                            threading.Thread(target=refresh_subs, daemon=True).start()
                         else:
-                            sys.stdout.write("\033[2J\033[H[i] 추천 영상 불러오는 중...")
+                            sys.stdout.write("\033[2J\033[H[i] 구독 채널 목록 불러오는 중...")
                             sys.stdout.flush()
                             try:
-                                new_data = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
-                                data["videos"] = new_data.get("videos", [])
-                                data["home_cache"] = data["videos"]
-                                data["type"] = "video_list"
-                                num_videos = len(data["videos"])
-                                scroll_row = 0
-                                selected_id = "video_0"
+                                new_data = fetch_youtube_channel_list(max_results, cookies_file, cookies_from_browser)
+                                data["subscriptions_list"] = new_data.get("videos", [])
+                                data["subs_expanded"] = True
                             except Exception as e:
-                                print(f"\n[!] 새로고침 실패: {e}")
+                                print(f"\n[!] 구독 목록 불러오기 실패: {e}")
                                 time.sleep(1)
                             sys.stdout.write("\033[2J\033[H")
                             sys.stdout.flush()
-                    elif selected_id == "side_0": # Subscriptions toggle
-                        if not data.get("subs_expanded"):
-                            if data.get("subscriptions_list"):
-                                # Use cached list immediately
-                                data["subs_expanded"] = True
-                                # Refresh in background for next time
-                                def refresh_subs():
-                                    try:
-                                        res = fetch_youtube_channel_list(max_results, cookies_file, cookies_from_browser)
-                                        data["subscriptions_list"] = res.get("videos", [])
-                                    except: pass
-                                threading.Thread(target=refresh_subs, daemon=True).start()
-                            else:
-                                sys.stdout.write("\033[2J\033[H[i] 구독 채널 목록 불러오는 중...")
-                                sys.stdout.flush()
-                                try:
-                                    new_data = fetch_youtube_channel_list(max_results, cookies_file, cookies_from_browser)
-                                    data["subscriptions_list"] = new_data.get("videos", [])
-                                    data["subs_expanded"] = True
-                                except Exception as e:
-                                    print(f"\n[!] 구독 목록 불러오기 실패: {e}")
-                                    time.sleep(1)
-                                sys.stdout.write("\033[2J\033[H")
-                                sys.stdout.flush()
-                        else:
-                            data["subs_expanded"] = False
-                            
-                    elif selected_id.startswith("sub_"): # Clicked a channel in sidebar
-                        idx = int(selected_id.split("_")[1])
-                        subs = data.get("subscriptions_list", [])
-                        if idx < len(subs):
-                            channel = subs[idx]
-                            cid = channel.get("channelId")
-                            sys.stdout.write(f"\033[2J\033[H[i] '{channel.get('title')}' 채널 영상 불러오는 중...")
-                            sys.stdout.flush()
-                            try:
-                                new_data = fetch_api_search(api_base, f"https://www.youtube.com/channel/{cid}", max_results)
-                                data["videos"] = new_data.get("videos", [])
-                                data["type"] = "video_list"
-                                num_videos = len(data["videos"])
-                                scroll_row = 0
-                                selected_id = "video_0"
-                            except Exception as e:
-                                print(f"\n[!] 채널 로딩 실패: {e}")
-                                time.sleep(2)
-                            sys.stdout.write("\033[2J\033[H")
-                            sys.stdout.flush()
-                    elif selected_id.startswith("video_") and data.get("type") == "channel_list":
-                        # Clicking a channel -> Fetch channel videos
-                        idx = int(selected_id.split("_")[1])
-                        channel = data["videos"][idx]
+                    else:
+                        data["subs_expanded"] = False
+                        
+                elif selected_id.startswith("sub_"): # Clicked a channel in sidebar
+                    idx = int(selected_id.split("_")[1])
+                    subs = data.get("subscriptions_list", [])
+                    if idx < len(subs):
+                        channel = subs[idx]
                         cid = channel.get("channelId")
                         sys.stdout.write(f"\033[2J\033[H[i] '{channel.get('title')}' 채널 영상 불러오는 중...")
                         sys.stdout.flush()
                         try:
-                            # We can use search for channel ID to get their videos
                             new_data = fetch_api_search(api_base, f"https://www.youtube.com/channel/{cid}", max_results)
                             data["videos"] = new_data.get("videos", [])
-                            data["type"] = "video_list" # Back to video grid
-                            current_max_results = len(data["videos"])
-                            num_videos = current_max_results
+                            data["type"] = "video_list"
+                            num_videos = len(data["videos"])
                             scroll_row = 0
                             selected_id = "video_0"
                         except Exception as e:
@@ -2198,237 +2177,258 @@ def run_interactive(
                             time.sleep(2)
                         sys.stdout.write("\033[2J\033[H")
                         sys.stdout.flush()
-                    elif selected_id == "side_1": # History
-                        sys.stdout.write("\033[2J\033[H[i] 시청 기록 불러오는 중...")
-                        sys.stdout.flush()
-                        try:
-                            history = load_history()
-                            data["videos"] = history
-                            data["type"] = "video_list"
-                            current_max_results = len(history)
-                            num_videos = current_max_results
-                            scroll_row = 0
-                            selected_id = "video_0" if history else "side_1"
-                        except Exception as e:
-                            print(f"\n[!] 시청 기록 불러오기 실패: {e}")
-                            time.sleep(2)
-                        sys.stdout.write("\033[2J\033[H")
-                        sys.stdout.flush()
-                    elif selected_id == "side_2" or selected_id == "tab_2": # Playlists / Library
-                        sys.stdout.write("\033[2J\033[H[i] 재생목록 불러오는 중...")
-                        sys.stdout.flush()
-                        try:
-                            new_data = fetch_youtube_playlists(max_results, cookies_file, cookies_from_browser)
-                            data["videos"] = new_data.get("videos", [])
-                            current_max_results = len(data["videos"])
-                            num_videos = current_max_results
-                            scroll_row = 0
-                            selected_id = "video_0"
-                        except Exception as e:
-                            print(f"\n[!] 재생목록 불러오기 실패: {e}")
-                            time.sleep(2)
-                        sys.stdout.write("\033[2J\033[H")
-                        sys.stdout.flush()
-                    elif selected_id == "account":
-                        if not logged_in:
-                            if old_settings:
-                                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                            try:
-                                # Start playwright login
-                                sys.stdout.write("\033[?25h\033[2J\033[H")
-                                sys.stdout.write("[i] Playwright 브라우저를 사용하여 로그인을 시도합니다...\n")
-                                sys.stdout.flush()
-                                
-                                script_dir = os.path.dirname(os.path.abspath(__file__))
-                                login_script = os.path.join(script_dir, "login_playwright.py")
-                                subprocess.run([sys.executable, login_script])
-                                
-                                # Check for the output cookies.txt
-                                netscape_path = os.path.join(os.getcwd(), "scratch", "cookies.txt")
-                                if os.path.exists(netscape_path):
-                                    print(f"[i] 쿠키 파일을 읽는 중: {netscape_path}")
-                                    configure_cookies(netscape_path)
-                                    logged_in = True
-                            except Exception as e:
-                                print(f"[!] 로그인 오류: {e}")
-                                time.sleep(2)
-                            
-                            if old_settings:
-                                tty.setcbreak(fd)
-                            sys.stdout.write("\033[?25l\033[2J\033[H")
-                            sys.stdout.flush()
-                        else:
-                            # Two-step logout
-                            if not data.get("logout_confirm"):
-                                data["logout_confirm"] = True
-                            else:
-                                # Confirmed logout
-                                sys.stdout.write("\033[2J\033[H[i] 로그아웃 중...")
-                                sys.stdout.flush()
-                                cookie_path = os.path.join(os.getcwd(), "scratch", "cookies.txt")
-                                if os.path.exists(cookie_path):
-                                    try: os.remove(cookie_path)
-                                    except: pass
-                                global REQUEST_COOKIE_JAR
-                                REQUEST_COOKIE_JAR = None
-                                logged_in = False
-                                data["logout_confirm"] = False
-                                sys.stdout.write("\033[2J\033[H")
-                                sys.stdout.flush()
-                    elif selected_id == "search":
+                elif selected_id.startswith("video_") and data.get("type") == "channel_list":
+                    # Clicking a channel -> Fetch channel videos
+                    idx = int(selected_id.split("_")[1])
+                    channel = data["videos"][idx]
+                    cid = channel.get("channelId")
+                    sys.stdout.write(f"\033[2J\033[H[i] '{channel.get('title')}' 채널 영상 불러오는 중...")
+                    sys.stdout.flush()
+                    try:
+                        # We can use search for channel ID to get their videos
+                        new_data = fetch_api_search(api_base, f"https://www.youtube.com/channel/{cid}", max_results)
+                        data["videos"] = new_data.get("videos", [])
+                        data["type"] = "video_list" # Back to video grid
+                        current_max_results = len(data["videos"])
+                        num_videos = current_max_results
+                        scroll_row = 0
+                        selected_id = "video_0"
+                    except Exception as e:
+                        print(f"\n[!] 채널 로딩 실패: {e}")
+                        time.sleep(2)
+                    sys.stdout.write("\033[2J\033[H")
+                    sys.stdout.flush()
+                elif selected_id == "side_1": # History
+                    sys.stdout.write("\033[2J\033[H[i] 시청 기록 불러오는 중...")
+                    sys.stdout.flush()
+                    try:
+                        history = load_history()
+                        data["videos"] = history
+                        data["type"] = "video_list"
+                        current_max_results = len(history)
+                        num_videos = current_max_results
+                        scroll_row = 0
+                        selected_id = "video_0" if history else "side_1"
+                    except Exception as e:
+                        print(f"\n[!] 시청 기록 불러오기 실패: {e}")
+                        time.sleep(2)
+                    sys.stdout.write("\033[2J\033[H")
+                    sys.stdout.flush()
+                elif selected_id == "side_2" or selected_id == "tab_2": # Playlists / Library
+                    sys.stdout.write("\033[2J\033[H[i] 재생목록 불러오는 중...")
+                    sys.stdout.flush()
+                    try:
+                        new_data = fetch_youtube_playlists(max_results, cookies_file, cookies_from_browser)
+                        data["videos"] = new_data.get("videos", [])
+                        current_max_results = len(data["videos"])
+                        num_videos = current_max_results
+                        scroll_row = 0
+                        selected_id = "video_0"
+                    except Exception as e:
+                        print(f"\n[!] 재생목록 불러오기 실패: {e}")
+                        time.sleep(2)
+                    sys.stdout.write("\033[2J\033[H")
+                    sys.stdout.flush()
+                elif selected_id == "account":
+                    if not logged_in:
                         if old_settings:
                             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                        sys.stdout.write("\033[?25h\033[2J\033[H")
-                        sys.stdout.write("[i] 검색어를 입력하세요: ")
-                        sys.stdout.flush()
                         try:
-                            new_query = input().strip()
-                            if new_query:
-                                query = new_query
-                                sys.stdout.write(f"\n[i] '{query}' 검색 중...")
-                                sys.stdout.flush()
-                                new_data = fetch_api_search(api_base, query, max_results)
-                                data["videos"] = new_data.get("videos", [])
-                                data["type"] = "video_list"
-                                current_max_results = len(data["videos"])
-                                num_videos = current_max_results
-                                scroll_row = 0
-                                selected_id = "video_0"
+                            # Start playwright login
+                            sys.stdout.write("\033[?25h\033[2J\033[H")
+                            sys.stdout.write("[i] Playwright 브라우저를 사용하여 로그인을 시도합니다...\n")
+                            sys.stdout.flush()
+                            
+                            script_dir = os.path.dirname(os.path.abspath(__file__))
+                            login_script = os.path.join(script_dir, "login_playwright.py")
+                            subprocess.run([sys.executable, login_script])
+                            
+                            # Check for the output cookies.txt
+                            netscape_path = os.path.join(os.getcwd(), "scratch", "cookies.txt")
+                            if os.path.exists(netscape_path):
+                                print(f"[i] 쿠키 파일을 읽는 중: {netscape_path}")
+                                configure_cookies(netscape_path)
+                                logged_in = True
                         except Exception as e:
-                            print(f"\n[!] 검색 실패: {e}")
+                            print(f"[!] 로그인 오류: {e}")
                             time.sleep(2)
+                        
                         if old_settings:
                             tty.setcbreak(fd)
                         sys.stdout.write("\033[?25l\033[2J\033[H")
                         sys.stdout.flush()
-                    elif selected_id == "tab_0": # Home
-                        sys.stdout.write("\033[2J\033[H[i] 추천 영상 새로고침 중...")
-                        sys.stdout.flush()
-                        query = None # Clear search query
-                        try:
-                            new_data = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
+                    else:
+                        # Two-step logout
+                        if not data.get("logout_confirm"):
+                            data["logout_confirm"] = True
+                        else:
+                            # Confirmed logout
+                            sys.stdout.write("\033[2J\033[H[i] 로그아웃 중...")
+                            sys.stdout.flush()
+                            cookie_path = os.path.join(os.getcwd(), "scratch", "cookies.txt")
+                            if os.path.exists(cookie_path):
+                                try: os.remove(cookie_path)
+                                except: pass
+                            global REQUEST_COOKIE_JAR
+                            REQUEST_COOKIE_JAR = None
+                            logged_in = False
+                            data["logout_confirm"] = False
+                            sys.stdout.write("\033[2J\033[H")
+                            sys.stdout.flush()
+                elif selected_id == "search":
+                    if old_settings:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    sys.stdout.write("\033[?25h\033[2J\033[H")
+                    sys.stdout.write("[i] 검색어를 입력하세요: ")
+                    sys.stdout.flush()
+                    try:
+                        new_query = input().strip()
+                        if new_query:
+                            query = new_query
+                            sys.stdout.write(f"\n[i] '{query}' 검색 중...")
+                            sys.stdout.flush()
+                            new_data = fetch_api_search(api_base, query, max_results)
                             data["videos"] = new_data.get("videos", [])
+                            data["type"] = "video_list"
                             current_max_results = len(data["videos"])
                             num_videos = current_max_results
                             scroll_row = 0
                             selected_id = "video_0"
-                        except Exception as e:
-                            print(f"\n[!] 새로고침 실패: {e}")
-                            time.sleep(2)
-                        sys.stdout.write("\033[2J\033[H")
-                        sys.stdout.flush()
-                    elif selected_id.startswith("video_"):
-                        idx = int(selected_id.split("_")[1])
-                        videos = data.get("videos", [])
-                        if 0 <= idx < len(videos):
-                            video = videos[idx]
+                    except Exception as e:
+                        print(f"\n[!] 검색 실패: {e}")
+                        time.sleep(2)
+                    if old_settings:
+                        tty.setcbreak(fd)
+                    sys.stdout.write("\033[?25l\033[2J\033[H")
+                    sys.stdout.flush()
+                elif selected_id == "tab_0": # Home
+                    sys.stdout.write("\033[2J\033[H[i] 추천 영상 새로고침 중...")
+                    sys.stdout.flush()
+                    query = None # Clear search query
+                    try:
+                        new_data = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
+                        data["videos"] = new_data.get("videos", [])
+                        current_max_results = len(data["videos"])
+                        num_videos = current_max_results
+                        scroll_row = 0
+                        selected_id = "video_0"
+                    except Exception as e:
+                        print(f"\n[!] 새로고침 실패: {e}")
+                        time.sleep(2)
+                    sys.stdout.write("\033[2J\033[H")
+                    sys.stdout.flush()
+                elif selected_id.startswith("video_"):
+                    idx = int(selected_id.split("_")[1])
+                    videos = data.get("videos", [])
+                    if 0 <= idx < len(videos):
+                        video = videos[idx]
+                        
+                        # Add to history
+                        save_to_history(video)
+                        
+                        url = video.get("url")
+                        if url:
+                            if url.startswith("/"):
+                                url = "https://www.youtube.com" + url
                             
-                            # Add to history
-                            save_to_history(video)
+                            # Restore terminal for subprocess
+                            if old_settings:
+                                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
                             
-                            url = video.get("url")
-                            if url:
-                                if url.startswith("/"):
-                                    url = "https://www.youtube.com" + url
-                                
-                                # Restore terminal for subprocess
-                                if old_settings:
-                                    termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-                                
-                                # Get path to video_ascii.py
-                                script_dir = os.path.dirname(os.path.abspath(__file__))
-                                player_script = os.path.join(script_dir, "video_ascii.py")
-                                
-                                # Build command
-                                cmd = [sys.executable, player_script, "--url", url]
-                                if should_use_color(color_mode, None):
-                                    cmd.append("--color")
-                                if cookies_file:
-                                    cmd.extend(["--cookies", cookies_file])
-                                if cookies_from_browser:
-                                    cmd.extend(["--cookies-from-browser", cookies_from_browser])
-                                
-                                # Fetch suggestions
-                                suggestions = []
-                                if api_base:
-                                    sys.stdout.write("\n[i] 추천 영상 정보 가져오는 중...")
-                                    sys.stdout.flush()
-                                    try:
-                                        v_data = fetch_api_video(api_base, url)
-                                        suggestions = v_data.get("suggestions", [])
-                                    except:
-                                        pass
-                                
-                                if not suggestions and data.get("videos"):
-                                    all_vids = data["videos"]
-                                    suggestions = [v for i, v in enumerate(all_vids) if i != idx][:8]
-                                
-                                if suggestions:
-                                    cmd.extend(["--suggestions", json.dumps(suggestions)])
-                                
-                                sys.stdout.write("\033[?25h\033[2J\033[H")
+                            # Get path to video_ascii.py
+                            script_dir = os.path.dirname(os.path.abspath(__file__))
+                            player_script = os.path.join(script_dir, "video_ascii.py")
+                            
+                            # Build command
+                            cmd = [sys.executable, player_script, "--url", url]
+                            if should_use_color(color_mode, None):
+                                cmd.append("--color")
+                            if cookies_file:
+                                cmd.extend(["--cookies", cookies_file])
+                            if cookies_from_browser:
+                                cmd.extend(["--cookies-from-browser", cookies_from_browser])
+                            
+                            # Fetch suggestions
+                            suggestions = []
+                            if api_base:
+                                sys.stdout.write("\n[i] 추천 영상 정보 가져오는 중...")
                                 sys.stdout.flush()
-                                
                                 try:
-                                    current_url = url
-                                    current_suggestions = suggestions
-                                    
-                                    while True:
-                                        if not current_url:
-                                            break
-                                            
-                                        # Build command for current URL and suggestions
-                                        current_cmd = [sys.executable, player_script, "--url", current_url]
-                                        if should_use_color(color_mode, None):
-                                            current_cmd.append("--color")
-                                        if cookies_file:
-                                            current_cmd.extend(["--cookies", cookies_file])
-                                        if cookies_from_browser:
-                                            current_cmd.extend(["--cookies-from-browser", cookies_from_browser])
-                                        if current_suggestions:
-                                            try:
-                                                current_cmd.extend(["--suggestions", json.dumps(current_suggestions)])
-                                            except: pass
-                                        
-                                        sys.stdout.write("\033[?25h\033[2J\033[H")
-                                        sys.stdout.flush()
-                                        
-                                        # Run player and capture exit code
-                                        proc = subprocess.run(current_cmd)
-                                        ret = proc.returncode
-                                        
-                                        # 100 ~ 109: User selected a recommendation
-                                        if 100 <= ret < 110 and current_suggestions:
-                                            s_idx = ret - 100
-                                            if 0 <= s_idx < len(current_suggestions):
-                                                next_vid = current_suggestions[s_idx]
-                                                next_url = next_vid.get("url")
-                                                if next_url:
-                                                    if next_url.startswith("/"):
-                                                        next_url = "https://www.youtube.com" + next_url
-                                                    
-                                                    current_url = next_url
-                                                    sys.stdout.write(f"\n[▶] '{next_vid.get('title', 'Next Video')}' 로 이동 중...")
-                                                    sys.stdout.flush()
-                                                    try:
-                                                        v_data = fetch_api_video(api_base, current_url)
-                                                        current_suggestions = v_data.get("suggestions", [])
-                                                    except:
-                                                        current_suggestions = []
-                                                    continue
-                                        break # Exit loop for normal termination
-                                except KeyboardInterrupt:
+                                    v_data = fetch_api_video(api_base, url)
+                                    suggestions = v_data.get("suggestions", [])
+                                except:
                                     pass
-                                except Exception as e:
-                                    sys.stdout.write(f"\n[!] 플레이어 오류: {e}\n")
-                                    sys.stdout.flush()
-                                    time.sleep(2)
+                            
+                            if not suggestions and data.get("videos"):
+                                all_vids = data["videos"]
+                                suggestions = [v for i, v in enumerate(all_vids) if i != idx][:8]
+                            
+                            if suggestions:
+                                cmd.extend(["--suggestions", json.dumps(suggestions)])
+                            
+                            sys.stdout.write("\033[?25h\033[2J\033[H")
+                            sys.stdout.flush()
+                            
+                            try:
+                                current_url = url
+                                current_suggestions = suggestions
                                 
-                                # Re-set cbreak for UI
-                                if old_settings:
-                                    tty.setcbreak(fd)
-                                sys.stdout.write("\033[?25l\033[2J\033[H")
+                                while True:
+                                    if not current_url:
+                                        break
+                                        
+                                    # Build command for current URL and suggestions
+                                    current_cmd = [sys.executable, player_script, "--url", current_url]
+                                    if should_use_color(color_mode, None):
+                                        current_cmd.append("--color")
+                                    if cookies_file:
+                                        current_cmd.extend(["--cookies", cookies_file])
+                                    if cookies_from_browser:
+                                        current_cmd.extend(["--cookies-from-browser", cookies_from_browser])
+                                    if current_suggestions:
+                                        try:
+                                            current_cmd.extend(["--suggestions", json.dumps(current_suggestions)])
+                                        except: pass
+                                    
+                                    sys.stdout.write("\033[?25h\033[2J\033[H")
+                                    sys.stdout.flush()
+                                    
+                                    # Run player and capture exit code
+                                    proc = subprocess.run(current_cmd)
+                                    ret = proc.returncode
+                                    
+                                    # 100 ~ 109: User selected a recommendation
+                                    if 100 <= ret < 110 and current_suggestions:
+                                        s_idx = ret - 100
+                                        if 0 <= s_idx < len(current_suggestions):
+                                            next_vid = current_suggestions[s_idx]
+                                            next_url = next_vid.get("url")
+                                            if next_url:
+                                                if next_url.startswith("/"):
+                                                    next_url = "https://www.youtube.com" + next_url
+                                                
+                                                current_url = next_url
+                                                sys.stdout.write(f"\n[▶] '{next_vid.get('title', 'Next Video')}' 로 이동 중...")
+                                                sys.stdout.flush()
+                                                try:
+                                                    v_data = fetch_api_video(api_base, current_url)
+                                                    current_suggestions = v_data.get("suggestions", [])
+                                                except:
+                                                    current_suggestions = []
+                                                continue
+                                    break # Exit loop for normal termination
+                            except KeyboardInterrupt:
+                                pass
+                            except Exception as e:
+                                sys.stdout.write(f"\n[!] 플레이어 오류: {e}\n")
                                 sys.stdout.flush()
+                                time.sleep(2)
+                            
+                            # Re-set cbreak for UI
+                            if old_settings:
+                                tty.setcbreak(fd)
+                            sys.stdout.write("\033[?25l\033[2J\033[H")
+                            sys.stdout.flush()
     except Exception as e:
         # Log error and exit safely
         if old_settings:
