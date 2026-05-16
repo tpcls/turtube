@@ -34,7 +34,7 @@ if exist "package.json" (
     REM 3000번 포트가 이미 사용 중인지 확인
     netstat -ano | findstr :3000 > nul
     if !errorlevel! equ 0 (
-        echo [i] API 서버가 이미 실행 중입니다 (Port 3000). 실행을 건너뜁니다.
+        echo [i] API 서버가 이미 실행 중입니다 Port 3000. 실행을 건너뜁니다.
     ) else (
         echo [i] API 서버 npm start 실행 중...
         start /b npm start
