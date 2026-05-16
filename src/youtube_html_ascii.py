@@ -1908,42 +1908,42 @@ def run_interactive(
 
     try:
         while True:
-                # Dynamic resize detection
-                curr_w, curr_h = resolve_output_size(None, None)
-                if curr_w != width or curr_h != height:
-                    width, height = curr_w, curr_h
-                    need_redraw = True
+            # Dynamic resize detection
+            curr_w, curr_h = resolve_output_size(None, None)
+            if curr_w != width or curr_h != height:
+                width, height = curr_w, curr_h
+                need_redraw = True
 
-                if need_redraw:
-                    # Move cursor to top
-                    sys.stdout.write("\033[H")
-                    
-                    # Recalculate layout if resized
-                    sidebar_w, content_w, columns, visible_rows = calc_layout(width, height)
-                    
-                    # Use pre-calculated values
-                    ascii_ui = render_home_interface(
-                        data,
-                        width,
-                        height - 1,
-                        selected_id=selected_id,
-                        scroll_row=scroll_row,
-                        logged_in=logged_in,
-                        query=query,
-                    )
-                    if should_use_color(color_mode, None):
-                        ascii_ui = colorize_ascii(ascii_ui)
-                    
-                    # Single atomic write to stdout
-                    sys.stdout.write("\n" + ascii_ui)
-                    sys.stdout.flush()
-                    need_redraw = False
+            if need_redraw:
+                # Move cursor to top
+                sys.stdout.write("\033[H")
                 
-                # Wait for key
-                key = get_input()
-                if key is None:
-                    time.sleep(0.01)
-                    continue
+                # Recalculate layout if resized
+                sidebar_w, content_w, columns, visible_rows = calc_layout(width, height)
+                
+                # Use pre-calculated values
+                ascii_ui = render_home_interface(
+                    data,
+                    width,
+                    height - 1,
+                    selected_id=selected_id,
+                    scroll_row=scroll_row,
+                    logged_in=logged_in,
+                    query=query,
+                )
+                if should_use_color(color_mode, None):
+                    ascii_ui = colorize_ascii(ascii_ui)
+                
+                # Single atomic write to stdout
+                sys.stdout.write("\n" + ascii_ui)
+                sys.stdout.flush()
+                need_redraw = False
+            
+            # Wait for key
+            key = get_input()
+            if key is None:
+                time.sleep(0.01)
+                continue
                     
                 need_redraw = True
                 
