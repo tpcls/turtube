@@ -2229,10 +2229,6 @@ def run_interactive(
                     sys.stdout.flush()
                 elif selected_id == "side_3": # Downloads mode toggle
                     data["download_mode"] = not data.get("download_mode", False)
-                    mode_str = "ON (빨간색 활성화)" if data["download_mode"] else "OFF"
-                    sys.stdout.write(f"\033[2J\033[H[↓] 다운로드 모드 {mode_str}\n영상에서 엔터를 누르면 백그라운드에서 다운로드됩니다.\n")
-                    sys.stdout.flush()
-                    time.sleep(1)
                 elif selected_id == "side_2" or selected_id == "tab_2": # Playlists / Library
                     sys.stdout.write("\033[2J\033[H[i] 재생목록 불러오는 중...")
                     sys.stdout.flush()
@@ -2387,9 +2383,6 @@ def run_interactive(
                                             _save_dl_cache(c)
                                     except: pass
                                 threading.Thread(target=_bg_download, daemon=True).start()
-                                sys.stdout.write(f"\n[↓] 백그라운드 다운로드 시작: {video.get('title','video')}\n")
-                                sys.stdout.flush()
-                                time.sleep(0.8)
 
                             # If local file exists → play with ffplay directly
                             if local_path and os.path.exists(local_path):
