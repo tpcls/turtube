@@ -931,6 +931,61 @@ def fetch_youtube_recommendations(
     }
 
 
+def fetch_more_recommendations(
+    cookies_file: str | None = None,
+    cookies_from_browser: str | None = None,
+    seen_ids: set[str] | None = None,
+) -> list[dict[str, str]]:
+    if seen_ids is None:
+        seen_ids = set()
+    urls = [
+        "https://www.youtube.com/?hl=ko&gl=KR",
+        "https://www.youtube.com/feed/trending?hl=ko&gl=KR",
+        "https://www.youtube.com/results?search_query=%EC%9D%B8%EA%B8%B0%20%EB%8F%99%EC%98%81%EC%83%81&hl=ko&gl=KR",
+        "https://www.youtube.com/results?search_query=popular%20videos&hl=ko&gl=KR",
+    ]
+    videos: list[dict[str, str]] = []
+    for url in urls:
+        if len(videos) >= 24:
+            break
+        try:
+            page_html = fetch_html(
+                url, 
+                cookies_file=cookies_file, 
+                cookies_from_browser=cookies_from_browser
+            )
+            initial_data = extract_json_blob(page_html, "var ytInitialData")
+            if not initial_data:
+                initial_data = extract_json_blob(page_html, "ytInitialData")
+            
+            temp_videos = []
+            temp_seen = set()
+            collect_renderer_videos(initial_data, temp_videos, temp_seen)
+            if not temp_videos:
+                temp_videos.extend(collect_html_video_ids(page_html, 50))
+                
+            for v in temp_videos:
+                vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                if vid_id and vid_id not in seen_ids:
+                    seen_ids.add(vid_id)
+                    videos.append(v)
+        except Exception:
+            pass
+            
+    if not videos:
+        try:
+            temp_videos = fetch_ytdlp_recommendations(30, cookies_file, cookies_from_browser)
+            for v in temp_videos:
+                vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                if vid_id and vid_id not in seen_ids:
+                    seen_ids.add(vid_id)
+                    videos.append(v)
+        except Exception:
+            pass
+            
+    return videos
+
+
 def fetch_youtube_video_direct(raw_input: str) -> dict[str, Any]:
     id = first_youtube_id_from_url(raw_input)
     if not id:
@@ -1802,6 +1857,84 @@ def run_interactive(
     need_redraw = True
     is_fetching = False
 
+    recommendation_queue = []
+
+    def trigger_replenish_bg():
+        nonlocal is_fetching
+        if is_fetching:
+            return
+        is_fetching = True
+        
+        def _bg_run():
+            nonlocal is_fetching
+            keywords = [
+                "인기 동영상", "추천 영화", "재미있는 예능", "드라마 하이라이트", 
+                "신곡 음악", "IT 테크", "게임 실황", "웃긴 동영상", 
+                "먹방", "여행 브이로그", "다큐멘터리", "최신 과학"
+            ]
+            try:
+                # 1. Homepage feeds
+                new_vids = fetch_more_recommendations(cookies_file, cookies_from_browser, seen_video_ids)
+                for v in new_vids:
+                    if v not in recommendation_queue:
+                        recommendation_queue.append(v)
+                
+                # 2. Trending searches
+                if len(recommendation_queue) < 40:
+                    import random
+                    kw = random.choice(keywords)
+                    try:
+                        search_data = fetch_youtube_search_direct(kw, 30)
+                        for v in search_data.get("videos", []):
+                            vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                            if vid_id and vid_id not in seen_video_ids:
+                                seen_video_ids.add(vid_id)
+                                recommendation_queue.append(v)
+                    except: pass
+                    
+                # 3. Related suggestions
+                if len(recommendation_queue) < 40 and data.get("videos"):
+                    import random
+                    target_vid = random.choice(data["videos"])
+                    vid_url = target_vid.get("url")
+                    if vid_url:
+                        if vid_url.startswith("/"):
+                            vid_url = "https://www.youtube.com" + vid_url
+                        try:
+                            v_info = fetch_youtube_video_direct(vid_url)
+                            for v in v_info.get("suggestions", []):
+                                vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                                if vid_id and vid_id not in seen_video_ids:
+                                    seen_video_ids.add(vid_id)
+                                    recommendation_queue.append(v)
+                        except: pass
+            except:
+                pass
+            finally:
+                is_fetching = False
+                
+        threading.Thread(target=_bg_run, daemon=True).start()
+
+    # Track currently loaded video IDs to avoid duplicates
+    seen_video_ids = set()
+    for v in data.get("videos", []):
+        vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+        if vid_id:
+            seen_video_ids.add(vid_id)
+
+    # Track page type
+    if query:
+        data["page"] = "search"
+    elif data.get("type") == "channel_list":
+        data["page"] = "subscriptions"
+    elif data.get("type") == "video_list":
+        data["page"] = "home"
+    else:
+        data["page"] = "home"
+
+    if data["page"] == "home":
+        trigger_replenish_bg()
+
     # Set terminal to cbreak mode on Unix to capture keys immediately
     old_settings = None
     if sys.platform != "win32":
@@ -1884,13 +2017,28 @@ def run_interactive(
     def fetch_more_bg():
         nonlocal is_fetching, current_max_results, num_videos, need_redraw
         try:
-            new_max = current_max_results + 18
-            new_data = fetch_api_search(api_base, query, min(100, new_max))
-            if len(new_data.get("videos", [])) > current_max_results:
-                data["videos"] = new_data["videos"]
-                current_max_results = len(data["videos"])
-                num_videos = current_max_results
-                need_redraw = True
+            if data.get("page") == "search" and query:
+                new_max = current_max_results + 18
+                new_data = fetch_api_search(api_base, query, min(300, new_max))
+                new_vids = new_data.get("videos", [])
+                added_any = False
+                for v in new_vids:
+                    vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                    if vid_id and vid_id not in seen_video_ids:
+                        seen_video_ids.add(vid_id)
+                        data["videos"].append(v)
+                        added_any = True
+                if added_any:
+                    current_max_results = len(data["videos"])
+                    num_videos = current_max_results
+                    need_redraw = True
+            elif data.get("page") == "home":
+                new_vids = fetch_more_recommendations(cookies_file, cookies_from_browser, seen_video_ids)
+                if new_vids:
+                    data["videos"].extend(new_vids)
+                    current_max_results = len(data["videos"])
+                    num_videos = current_max_results
+                    need_redraw = True
         except:
             pass
         finally:
@@ -2043,11 +2191,28 @@ def run_interactive(
                             if (new_idx // columns) >= scroll_row + visible_rows:
                                 scroll_row = (new_idx // columns) - visible_rows + 1
 
-                    # Proactive Load More in Background
-                    if query and api_base and current_max_results < 100 and not is_fetching:
-                        if (is_down or is_right) and (idx >= num_videos - 3):
+                    # Proactive Load More in Background / Cache Queue
+                    is_near_bottom = (is_down or is_right) and (idx >= num_videos - 6)
+                    if is_near_bottom:
+                        if data.get("page") == "search" and query and not is_fetching and current_max_results < 300:
                             is_fetching = True
                             threading.Thread(target=fetch_more_bg, daemon=True).start()
+                        elif data.get("page") == "home":
+                            if recommendation_queue:
+                                batch = []
+                                while recommendation_queue and len(batch) < 18:
+                                    batch.append(recommendation_queue.pop(0))
+                                if batch:
+                                    data["videos"].extend(batch)
+                                    current_max_results = len(data["videos"])
+                                    num_videos = current_max_results
+                                    need_redraw = True
+                            else:
+                                if not is_fetching:
+                                    trigger_replenish_bg()
+                            
+                            if len(recommendation_queue) < 30 and not is_fetching:
+                                trigger_replenish_bg()
                             
                 elif selected_id.startswith("side_") or selected_id.startswith("sub_"):
                     idx = int(selected_id.split("_")[1])
@@ -2112,6 +2277,8 @@ def run_interactive(
             
             elif key == b'enter': # Enter
                 if selected_id == "logo" or selected_id == "tab_0": # YouTube Logo = Home Refresh
+                    data["page"] = "home"
+                    recommendation_queue.clear()
                     if data.get("home_cache"):
                         # Use cache immediately
                         data["videos"] = data["home_cache"]
@@ -2119,7 +2286,16 @@ def run_interactive(
                         num_videos = len(data["videos"])
                         scroll_row = 0
                         selected_id = "video_0"
-                        # Refresh cache in background for next time
+                        
+                        # Reset seen_video_ids
+                        seen_video_ids.clear()
+                        for v in data["videos"]:
+                            vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                            if vid_id:
+                                seen_video_ids.add(vid_id)
+
+                        # Refresh cache and recommendation queue in background for next time
+                        trigger_replenish_bg()
                         def refresh_home():
                             try:
                                 res = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
@@ -2137,6 +2313,14 @@ def run_interactive(
                             num_videos = len(data["videos"])
                             scroll_row = 0
                             selected_id = "video_0"
+                            
+                            # Reset seen_video_ids
+                            seen_video_ids.clear()
+                            for v in data["videos"]:
+                                vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                                if vid_id:
+                                    seen_video_ids.add(vid_id)
+                            trigger_replenish_bg()
                         except Exception as e:
                             print(f"\n[!] 새로고침 실패: {e}")
                             time.sleep(1)
@@ -2181,6 +2365,14 @@ def run_interactive(
                             new_data = fetch_api_search(api_base, f"https://www.youtube.com/channel/{cid}", max_results)
                             data["videos"] = new_data.get("videos", [])
                             data["type"] = "video_list"
+                            data["page"] = "channel"
+                            
+                            seen_video_ids.clear()
+                            for v in data["videos"]:
+                                vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                                if vid_id:
+                                    seen_video_ids.add(vid_id)
+                                    
                             num_videos = len(data["videos"])
                             scroll_row = 0
                             selected_id = "video_0"
@@ -2201,6 +2393,14 @@ def run_interactive(
                         new_data = fetch_api_search(api_base, f"https://www.youtube.com/channel/{cid}", max_results)
                         data["videos"] = new_data.get("videos", [])
                         data["type"] = "video_list" # Back to video grid
+                        data["page"] = "channel"
+                        
+                        seen_video_ids.clear()
+                        for v in data["videos"]:
+                            vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                            if vid_id:
+                                seen_video_ids.add(vid_id)
+                                
                         current_max_results = len(data["videos"])
                         num_videos = current_max_results
                         scroll_row = 0
@@ -2217,6 +2417,14 @@ def run_interactive(
                         history = load_history()
                         data["videos"] = history
                         data["type"] = "video_list"
+                        data["page"] = "history"
+                        
+                        seen_video_ids.clear()
+                        for v in data["videos"]:
+                            vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                            if vid_id:
+                                seen_video_ids.add(vid_id)
+                                
                         current_max_results = len(history)
                         num_videos = current_max_results
                         scroll_row = 0
@@ -2289,6 +2497,14 @@ def run_interactive(
                             new_data = fetch_api_search(api_base, query, max_results)
                             data["videos"] = new_data.get("videos", [])
                             data["type"] = "video_list"
+                            data["page"] = "search"
+                            
+                            seen_video_ids.clear()
+                            for v in data["videos"]:
+                                vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                                if vid_id:
+                                    seen_video_ids.add(vid_id)
+                                    
                             current_max_results = len(data["videos"])
                             num_videos = current_max_results
                             scroll_row = 0
@@ -2307,6 +2523,17 @@ def run_interactive(
                     try:
                         new_data = fetch_youtube_recommendations(max_results, cookies_file, cookies_from_browser)
                         data["videos"] = new_data.get("videos", [])
+                        data["page"] = "home"
+                        
+                        seen_video_ids.clear()
+                        for v in data["videos"]:
+                            vid_id = v.get("id") or first_youtube_id_from_url(v.get("url", ""))
+                            if vid_id:
+                                seen_video_ids.add(vid_id)
+                                
+                        recommendation_queue.clear()
+                        trigger_replenish_bg()
+                                
                         current_max_results = len(data["videos"])
                         num_videos = current_max_results
                         scroll_row = 0
